@@ -325,17 +325,6 @@ tools/sbgc_probe.c        strictly read-only board probe
 test/test_sbgc_api.c      protocol and parser tests
 ```
 
-## Reference documentation
-
-The implementation was checked against BaseCam's SimpleBGC32 documentation,
-including the 2.6x user manual, encoder manual, 43xx hardware manual, serial API
-specification, and published command examples. Obtain current copies from
-[BaseCam's official documentation and Serial API pages](https://www.basecamelectronics.com/serialapi/).
-
-The local `manuals/` directory is intentionally ignored. Vendor PDFs are not
-part of this project's MIT-licensed source distribution, and their absence does
-not affect the build.
-
 ## Scope and non-goals
 
 This project does not:
