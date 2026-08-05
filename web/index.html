@@ -1,0 +1,1336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SimpleBGC32 Control</title>
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   Instrument panel. Colours follow the aviation convention the operator
+   already knows: green normal, amber caution, red warning. Legends are set
+   like silkscreen on a machined panel — small, letter-spaced, never shouting.
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --housing:   #141816;
+  --panel:     #1E2422;
+  --panel-hi:  #272E2B;
+  --engrave:   #0F1312;
+  --rule:      #333C38;
+
+  --ink:       #E9E7DE;
+  --legend:    #8B968F;
+  --legend-dim:#5D6862;
+
+  --live:      #7FD1AE;
+  --caution:   #E8B44A;
+  --alarm:     #E4614C;
+  --advisory:  #6FA8C7;
+
+  --sky:       #3D6B89;
+  --ground:    #6A5334;
+
+  --data: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --face: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--housing); color: var(--ink);
+  font-family: var(--face); font-size: 15px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.legend {
+  font-size: 10px; font-weight: 600; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--legend);
+}
+
+/* ── masthead ─────────────────────────────────────────────────────────── */
+.masthead {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 20px; background: var(--panel);
+  border-bottom: 1px solid var(--rule); position: sticky; top: 0; z-index: 30;
+}
+.wordmark { font-size: 13px; font-weight: 700; letter-spacing: .2em;
+            text-transform: uppercase; margin: 0; }
+.wordmark span { color: var(--legend); font-weight: 500; }
+.masthead .fill { flex: 1; }
+
+.plate {
+  font-family: var(--data); font-size: 10px; letter-spacing: .14em;
+  text-transform: uppercase; padding: 5px 9px;
+  border: 1px solid var(--rule); background: var(--engrave);
+  color: var(--legend); white-space: nowrap;
+}
+.plate.safe  { color: var(--live);    border-color: #2F5A48; }
+.plate.hot   { color: var(--alarm);   border-color: #6B3129; background: #2A1614; }
+.plate.stale { color: var(--caution); border-color: #5E4A21; }
+
+/* ── layout ───────────────────────────────────────────────────────────── */
+.deck { display: grid; gap: 1px; background: var(--rule);
+        grid-template-columns: minmax(320px, 400px) minmax(0, 1fr); }
+@media (max-width: 900px) { .deck { grid-template-columns: minmax(0, 1fr); } }
+
+.bay { background: var(--panel); padding: 16px 20px 20px; min-width: 0; }
+.bay > .legend { display: block; margin-bottom: 12px; }
+.span-all { grid-column: 1 / -1; }
+
+/* ── attitude indicator ───────────────────────────────────────────────── */
+.attitude { display: block; width: 100%; max-width: 300px; margin: 0 auto; }
+.att-frame { fill: var(--engrave); stroke: var(--rule); stroke-width: 1; }
+.att-sky { fill: var(--sky); }
+.att-ground { fill: var(--ground); }
+.att-horizon { stroke: #DCE6EC; stroke-width: 1.6; }
+.att-ladder { stroke: #CFD9DE; stroke-width: 1; opacity: .85; }
+.att-ladder-text { fill: #CFD9DE; font-family: var(--data); font-size: 7px; opacity: .85; }
+.att-bezel { fill: none; stroke: var(--rule); stroke-width: 6; }
+.att-tick { stroke: var(--legend); stroke-width: 1.2; }
+.att-tick-major { stroke: var(--ink); stroke-width: 1.6; }
+.att-pointer { fill: var(--caution); }
+.att-boresight { stroke: var(--caution); stroke-width: 2.2; fill: none; }
+.att-boresight-dot { fill: var(--caution); }
+
+.tape-wrap { position: relative; margin: 12px auto 0; max-width: 300px;
+             border: 1px solid var(--rule); background: var(--engrave);
+             height: 40px; overflow: hidden; }
+.tape-wrap::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
+                    width: 1px; background: var(--caution); transform: translateX(-.5px); }
+.tape { position: absolute; inset: 0; }
+.tape-tick { stroke: var(--legend-dim); stroke-width: 1; }
+.tape-tick-major { stroke: var(--legend); stroke-width: 1.4; }
+.tape-text { fill: var(--ink); font-family: var(--data); font-size: 9px; text-anchor: middle; }
+
+.att-figures { display: grid; grid-template-columns: repeat(3, 1fr);
+               margin: 12px auto 0; max-width: 300px; gap: 1px;
+               background: var(--rule); border: 1px solid var(--rule); }
+.fig { background: var(--engrave); padding: 8px 6px; text-align: center; }
+.fig .legend { display: block; margin-bottom: 3px; }
+.fig .val { font-family: var(--data); font-variant-numeric: tabular-nums;
+            font-size: 18px; font-weight: 600; }
+.fig .sub { font-family: var(--data); font-size: 10px; color: var(--legend-dim); }
+.fig.out .val { color: var(--caution); }
+
+/* ── control surface ──────────────────────────────────────────────────── */
+.ctl-head { display: flex; align-items: baseline; gap: 12px;
+            flex-wrap: wrap; margin-bottom: 12px; }
+.ctl-head .legend { margin: 0; }
+.ctl-state { font-family: var(--data); font-size: 11px; letter-spacing: .08em;
+             text-transform: uppercase; color: var(--legend-dim); }
+.ctl-state.on { color: var(--live); }
+
+.ctl-grid { display: grid; gap: 20px; grid-template-columns: 230px minmax(0, 1fr);
+            margin-bottom: 14px; }
+@media (max-width: 620px) { .ctl-grid { grid-template-columns: minmax(0, 1fr);
+                                        justify-items: center; } }
+
+/* The stick. Drag it and the camera moves; let go and it stops. */
+.stick {
+  position: relative; width: 230px; height: 230px; max-width: 100%;
+  aspect-ratio: 1; border-radius: 50%;
+  background: radial-gradient(circle at 50% 45%, #232A27 0%, var(--engrave) 72%);
+  border: 1px solid var(--rule);
+  touch-action: none; cursor: grab; user-select: none;
+  display: grid; place-items: center;
+}
+.stick.live { cursor: grabbing; border-color: #5E4A21; }
+.stick.off { opacity: .4; cursor: not-allowed; }
+.stick svg { position: absolute; inset: 0; width: 100%; height: 100%;
+             pointer-events: none; }
+.stick-guide { stroke: var(--rule); stroke-width: 1; }
+.stick-dead { fill: none; stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 4; }
+.stick-knob {
+  position: absolute; width: 66px; height: 66px; border-radius: 50%;
+  background: var(--panel-hi); border: 2px solid var(--legend-dim);
+  pointer-events: none; display: grid; place-items: center;
+  transition: border-color .1s linear, background-color .1s linear;
+}
+.stick.live .stick-knob { border-color: var(--caution); background: #2B2519; }
+.stick-knob::after { content: ""; width: 8px; height: 8px; border-radius: 50%;
+                     background: var(--legend-dim); }
+.stick.live .stick-knob::after { background: var(--caution); }
+.stick-hint { position: absolute; bottom: 16px; left: 0; right: 0; text-align: center;
+              font-family: var(--data); font-size: 9.5px; letter-spacing: .1em;
+              text-transform: uppercase; color: var(--legend-dim); pointer-events: none; }
+
+/* right-hand column of the control bay */
+.ctl-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+.speed-row { display: flex; align-items: center; gap: 12px; }
+.speed-row input[type=range] { flex: 1; accent-color: var(--caution); min-width: 0; }
+.speed-val { font-family: var(--data); font-size: 13px; min-width: 8ch; text-align: right; }
+
+.actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; }
+
+.btn {
+  font-family: var(--data); font-size: 11.5px; font-weight: 600;
+  letter-spacing: .1em; text-transform: uppercase;
+  padding: 11px 14px; color: var(--ink);
+  background: var(--panel-hi); border: 1px solid var(--rule); cursor: pointer;
+}
+.btn:hover:not(:disabled) { background: var(--rule); }
+.btn:disabled { color: var(--legend-dim); cursor: not-allowed; }
+.btn.arm-on { color: var(--alarm); border-color: #6B3129; background: #261412; }
+.btn.stop { color: var(--caution); border-color: #5E4A21; }
+:focus-visible { outline: 2px solid var(--caution); outline-offset: 2px; }
+
+/* input legend */
+.inputs { border: 1px solid var(--rule); background: var(--engrave); }
+.input-row { display: grid; grid-template-columns: 92px minmax(0, 1fr);
+             gap: 10px; padding: 8px 12px; align-items: baseline; }
+.input-row + .input-row { border-top: 1px solid var(--panel); }
+.input-row .who { font-family: var(--data); font-size: 10px; letter-spacing: .1em;
+                  text-transform: uppercase; color: var(--legend); }
+.input-row .how { font-size: 12.5px; color: var(--legend); }
+.input-row .how kbd {
+  font-family: var(--data); font-size: 11px; background: var(--panel-hi);
+  border: 1px solid var(--rule); border-bottom-width: 2px;
+  padding: 1px 5px; margin-right: 3px; color: var(--ink);
+}
+.input-row.armed-src .who { color: var(--live); }
+
+/* ── annunciators ─────────────────────────────────────────────────────── */
+.annunciators { display: grid; gap: 8px;
+                grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); }
+.lamp { border: 1px solid var(--rule); background: var(--engrave);
+        padding: 9px 8px; text-align: center;
+        font-family: var(--data); font-size: 10px; font-weight: 600;
+        letter-spacing: .1em; text-transform: uppercase; color: var(--legend-dim);
+        transition: color .12s linear, background-color .12s linear, border-color .12s linear; }
+.lamp.lit-live    { color: var(--live);    border-color: #2F5A48; background: #16241E; }
+.lamp.lit-caution { color: var(--caution); border-color: #5E4A21; background: #241E12; }
+.lamp.lit-alarm   { color: var(--alarm);   border-color: #6B3129; background: #261412; }
+.lamp .sub { display: block; font-size: 9px; letter-spacing: .04em; font-weight: 500;
+             opacity: .75; margin-top: 3px; text-transform: none; }
+
+/* ── messages ─────────────────────────────────────────────────────────── */
+.messages { display: flex; flex-direction: column; gap: 1px; background: var(--rule);
+            border: 1px solid var(--rule); min-width: 0; }
+.msg { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 12px;
+       background: var(--panel-hi); padding: 9px 12px; font-size: 13.5px;
+       overflow-wrap: anywhere; }
+.msg .tag { font-family: var(--data); font-size: 10px; font-weight: 700;
+            letter-spacing: .1em; padding-top: 3px; }
+.msg.alarm .tag { color: var(--alarm); }
+.msg.caution .tag { color: var(--caution); }
+.msg.advisory .tag { color: var(--advisory); }
+.msg-none { background: var(--panel-hi); padding: 13px 12px;
+            color: var(--legend); font-size: 13.5px; }
+
+/* ── data rows and tables ─────────────────────────────────────────────── */
+.rows { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto); gap: 0; }
+.rows dt { padding: 7px 16px 7px 0; color: var(--legend); font-size: 13px;
+           border-bottom: 1px solid var(--engrave); }
+.rows dd { margin: 0; padding: 7px 0 7px 16px; text-align: right;
+           font-family: var(--data); font-size: 13px;
+           font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+           border-bottom: 1px solid var(--engrave); }
+.rows dd.warn { color: var(--caution); }
+.rows dd.bad { color: var(--alarm); }
+
+.sheet { width: 100%; border-collapse: collapse; font-family: var(--data);
+         font-size: 13px; font-variant-numeric: tabular-nums; }
+.sheet th, .sheet td { padding: 7px 10px; text-align: right;
+                       border-bottom: 1px solid var(--engrave); }
+.sheet thead th { color: var(--legend); font-size: 10px; font-weight: 600;
+                  letter-spacing: .1em; text-transform: uppercase;
+                  border-bottom: 1px solid var(--rule); }
+.sheet th:first-child, .sheet td:first-child { text-align: left; color: var(--legend); }
+.sheet tbody tr:hover { background: var(--panel-hi); }
+.scroller { overflow-x: auto; }
+
+.note { color: var(--legend); font-size: 13px; max-width: 64ch; margin: 0 0 14px; }
+.hint { color: var(--legend-dim); font-size: 12px; font-family: var(--data);
+        margin: 10px 0 0; }
+
+.port-pick { display: flex; gap: 8px; margin-bottom: 4px; }
+.port-pick select {
+  flex: 1; min-width: 0; font-family: var(--data); font-size: 12px;
+  padding: 9px 10px; color: var(--ink);
+  background: var(--engrave); border: 1px solid var(--rule);
+}
+.port-pick .btn { white-space: nowrap; }
+
+/* ── per-axis dials ──────────────────────────────────────────────────── */
+.dials { display: grid; gap: 14px;
+         grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.dial { background: var(--engrave); border: 1px solid var(--rule);
+        padding: 12px; text-align: center; }
+.dial svg { width: 100%; max-width: 170px; height: auto; }
+.dial-cap { display: flex; justify-content: space-between; align-items: baseline;
+            margin-top: 6px; }
+.dial-val { font-family: var(--data); font-variant-numeric: tabular-nums;
+            font-size: 17px; font-weight: 600; }
+.dial-face { fill: none; stroke: var(--rule); stroke-width: 1; }
+.dial-band { fill: none; stroke: #2A322E; stroke-width: 9; }
+.dial-allow { fill: none; stroke: #24402F; stroke-width: 9; }
+.dial-tick { stroke: var(--legend-dim); stroke-width: 1; }
+.dial-tick-major { stroke: var(--legend); stroke-width: 1.5; }
+.dial-label { fill: var(--legend-dim); font-family: var(--data); font-size: 8px;
+              text-anchor: middle; }
+.dial-needle { stroke: var(--live); stroke-width: 2.4; stroke-linecap: round; }
+.dial-needle.blocked { stroke: var(--alarm); }
+.dial-target { stroke: var(--caution); stroke-width: 1.2; stroke-dasharray: 2 2; }
+.dial-hub { fill: var(--legend); }
+
+/* ── limits ──────────────────────────────────────────────────────────── */
+.limit-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.lim-field { display: flex; flex-direction: column; gap: 4px; }
+.lim-field input {
+  width: 92px; font-family: var(--data); font-size: 13px; padding: 8px 9px;
+  color: var(--ink); background: var(--engrave); border: 1px solid var(--rule);
+}
+.lim-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px;
+              color: var(--legend); padding-bottom: 8px; }
+.lim-toggle input { accent-color: var(--caution); width: 16px; height: 16px; }
+
+/* Calibration progress. */
+.calib { border: 1px solid #5E4A21; background: #241E12; padding: 12px 14px;
+         margin-top: 14px; }
+.calib-head { display: flex; justify-content: space-between; align-items: baseline; }
+.calib-count { font-family: var(--data); font-size: 12px; color: var(--caution); }
+.calib-track { height: 6px; background: var(--engrave); margin: 10px 0 0;
+               border: 1px solid var(--rule); overflow: hidden; }
+.calib-track i { display: block; height: 100%; width: 0;
+                 background: var(--caution); transition: width .2s linear; }
+.calib .hint { margin-top: 8px; color: var(--caution); }
+
+/* Transient acknowledgement, so a press is never silent. */
+.toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  background: var(--panel-hi); border: 1px solid var(--rule);
+  color: var(--ink); font-family: var(--data); font-size: 12.5px;
+  padding: 11px 18px; z-index: 60; pointer-events: none;
+  opacity: 0; transition: opacity .18s ease;
+  max-width: calc(100vw - 32px);
+}
+.toast.show { opacity: 1; }
+.toast.good { border-color: #2F5A48; color: var(--live); }
+.toast.bad  { border-color: #6B3129; color: var(--alarm); }
+.footnote { color: var(--legend-dim); font-size: 12px; font-family: var(--data);
+            padding: 14px 20px 28px; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <h1 class="wordmark">SimpleBGC32 <span>Control</span></h1>
+  <span class="plate" id="pMode">—</span>
+  <span class="plate" id="pLive">—</span>
+  <span class="fill"></span>
+  <span class="plate" id="pLink">—</span>
+</header>
+
+<div class="deck">
+
+  <!-- ── attitude ───────────────────────────────────────────────────── -->
+  <section class="bay">
+    <span class="legend">Camera attitude</span>
+
+    <svg class="attitude" viewBox="0 0 200 200" role="img"
+         aria-label="Artificial horizon showing camera roll and pitch">
+      <defs><clipPath id="ballClip"><circle cx="100" cy="100" r="74"/></clipPath></defs>
+      <circle class="att-frame" cx="100" cy="100" r="80"/>
+      <g clip-path="url(#ballClip)">
+        <g id="ball">
+          <rect class="att-sky"    x="-220" y="-320" width="640" height="420"/>
+          <rect class="att-ground" x="-220" y="100"  width="640" height="420"/>
+          <line class="att-horizon" x1="-220" y1="100" x2="420" y2="100"/>
+          <g id="ladder"></g>
+        </g>
+      </g>
+      <circle class="att-bezel" cx="100" cy="100" r="77"/>
+      <g id="rollTicks"></g>
+      <polygon class="att-pointer" id="rollPointer" points="100,26 96,34 104,34"/>
+      <path class="att-boresight" d="M70,100 L88,100 M112,100 L130,100 M100,88 L100,94"/>
+      <circle class="att-boresight-dot" cx="100" cy="100" r="2.2"/>
+    </svg>
+
+    <div class="tape-wrap"><svg class="tape" id="tape" viewBox="0 0 300 40"
+         preserveAspectRatio="none"></svg></div>
+
+    <div class="att-figures">
+      <div class="fig" id="figYaw"><span class="legend">Yaw</span>
+        <div class="val" id="vYaw">—</div><div class="sub" id="sYaw">—</div></div>
+      <div class="fig" id="figPitch"><span class="legend">Pitch</span>
+        <div class="val" id="vPitch">—</div><div class="sub" id="sPitch">—</div></div>
+      <div class="fig" id="figRoll"><span class="legend">Roll</span>
+        <div class="val" id="vRoll">—</div><div class="sub" id="sRoll">—</div></div>
+    </div>
+  </section>
+
+  <!-- ── control ────────────────────────────────────────────────────── -->
+  <section class="bay">
+    <div class="ctl-head">
+      <span class="legend">Control</span>
+      <span class="ctl-state" id="ctlState">—</span>
+    </div>
+    <p class="note" id="ctlNote">—</p>
+
+    <div class="ctl-grid">
+      <div class="stick off" id="stick" role="application" tabindex="0"
+           aria-label="Pan and tilt control. Drag to move the camera; release to stop.">
+        <svg viewBox="0 0 260 260">
+          <line class="stick-guide" x1="130" y1="18" x2="130" y2="242"/>
+          <line class="stick-guide" x1="18" y1="130" x2="242" y2="130"/>
+          <circle class="stick-dead" cx="130" cy="130" r="26"/>
+          <circle class="stick-dead" cx="130" cy="130" r="112"/>
+        </svg>
+        <div class="stick-knob" id="knob"></div>
+        <div class="stick-hint" id="stickHint">Arm to enable</div>
+      </div>
+
+      <div class="ctl-side">
+        <button class="btn" id="armBtn" disabled>Arm control</button>
+
+        <div class="speed-row">
+          <span class="legend">Speed</span>
+          <input type="range" id="speed" min="1" max="120" step="1" value="30" disabled
+                 aria-label="Maximum slew rate in degrees per second">
+          <span class="speed-val" id="speedVal">30 °/s</span>
+        </div>
+
+        <div class="actions">
+          <button class="btn stop" data-act="stop" disabled>Stop</button>
+          <button class="btn" data-act="home" disabled
+                  title="Move the camera to the home position">Go home</button>
+          <button class="btn" data-act="level" disabled
+                  title="Roll and pitch level with the horizon, yaw straight ahead">Level</button>
+          <button class="btn" id="motorBtn" data-act="motors" disabled>Motors on</button>
+          <button class="btn" data-act="sethome" disabled
+                  title="Make the position the camera is in right now the new home">Set home here</button>
+          <button class="btn" id="clearHomeBtn" data-act="clearhome" disabled
+                  title="Forget the taught home and use the board's built-in one">Clear taught home</button>
+          <button class="btn" data-act="calibgyro" disabled
+                  title="Calibrate the gyroscope — the gimbal must be completely still">Calibrate gyro</button>
+        </div>
+        <p class="hint" id="homeHint">Home: the board's built-in position.</p>
+
+        <div class="calib" id="calibBox" hidden>
+          <div class="calib-head">
+            <span class="legend">Calibrating gyroscope</span>
+            <span class="calib-count" id="calibCount"></span>
+          </div>
+          <div class="calib-track"><i id="calibBar"></i></div>
+          <p class="hint">Keep the gimbal completely still until this finishes.</p>
+        </div>
+
+        <p class="hint" id="lastCmd"></p>
+
+      </div>
+    </div>
+
+    <div class="inputs">
+      <div class="input-row" id="srcTouch">
+        <span class="who">Touch</span>
+        <span class="how">Drag the stick, release to stop.</span>
+      </div>
+      <div class="input-row" id="srcKeys">
+        <span class="who">Keyboard</span>
+        <span class="how"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrows pan
+          and tilt · <kbd>H</kbd> home · <kbd>L</kbd> level ·
+          <kbd>Space</kbd> stop</span>
+      </div>
+      <div class="input-row" id="srcPad">
+        <span class="who">Gamepad</span>
+        <span class="how" id="padHow">Hold <kbd>LB</kbd>. Left stick pans, right stick tilts.</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── per-axis dials ─────────────────────────────────────────────── -->
+  <section class="bay span-all">
+    <span class="legend">Axis dials</span>
+    <div class="dials">
+      <div class="dial"><svg viewBox="0 0 130 130" id="dialYaw"></svg>
+        <div class="dial-cap"><span class="legend">Yaw</span>
+          <span class="dial-val" id="dYawVal">—</span></div></div>
+      <div class="dial"><svg viewBox="0 0 130 130" id="dialPitch"></svg>
+        <div class="dial-cap"><span class="legend">Pitch</span>
+          <span class="dial-val" id="dPitchVal">—</span></div></div>
+      <div class="dial"><svg viewBox="0 0 130 130" id="dialRoll"></svg>
+        <div class="dial-cap"><span class="legend">Roll</span>
+          <span class="dial-val" id="dRollVal">—</span></div></div>
+    </div>
+  </section>
+
+  <!-- ── caution panel ──────────────────────────────────────────────── -->
+  <section class="bay">
+    <span class="legend">Caution panel</span>
+    <div class="annunciators">
+      <div class="lamp" id="lampLink">Link<span class="sub" id="lampLinkSub">—</span></div>
+      <div class="lamp" id="lampMotors">Motors<span class="sub" id="lampMotorsSub">—</span></div>
+      <div class="lamp" id="lampBatt">Battery<span class="sub" id="lampBattSub">—</span></div>
+      <div class="lamp" id="lampFault">Board<span class="sub" id="lampFaultSub">—</span></div>
+      <div class="lamp" id="lampPad">Gamepad<span class="sub" id="lampPadSub">—</span></div>
+      <div class="lamp" id="lampRc">RC input<span class="sub" id="lampRcSub">—</span></div>
+    </div>
+  </section>
+
+  <section class="bay">
+    <span class="legend">Messages</span>
+    <div class="messages" id="messages">
+      <div class="msg-none">Waiting for the first reading.</div>
+    </div>
+  </section>
+
+  <!-- ── travel limits ──────────────────────────────────────────────── -->
+  <section class="bay span-all">
+    <span class="legend">Travel limits</span>
+    <p class="note">Set the range this program will drive the camera through.
+      At a limit it refuses to go further, but always lets you come back.
+      Roll is not listed: it is held level and never commanded to turn.</p>
+    <div class="limit-row">
+      <label class="lim-toggle">
+        <input type="checkbox" id="limOn"> <span>Enforce limits</span>
+      </label>
+      <span class="lim-field"><span class="legend">Yaw min</span>
+        <input type="number" id="limYawMin" step="1" min="-180" max="180"></span>
+      <span class="lim-field"><span class="legend">Yaw max</span>
+        <input type="number" id="limYawMax" step="1" min="-180" max="180"></span>
+      <span class="lim-field"><span class="legend">Pitch min</span>
+        <input type="number" id="limPitchMin" step="1" min="-180" max="180"></span>
+      <span class="lim-field"><span class="legend">Pitch max</span>
+        <input type="number" id="limPitchMax" step="1" min="-180" max="180"></span>
+      <button class="btn" id="limApply">Apply</button>
+    </div>
+  </section>
+
+  <!-- ── link + board ───────────────────────────────────────────────── -->
+  <section class="bay">
+    <span class="legend">Link</span>
+
+    <div class="port-pick">
+      <select id="portSel" aria-label="Serial port"><option>—</option></select>
+      <button class="btn" id="portBtn">Connect</button>
+    </div>
+    <p class="hint" id="portNote"></p>
+
+    <dl class="rows">
+      <dt>Serial port</dt><dd id="dPort">—</dd>
+      <dt>Baud</dt><dd id="dBaud">—</dd>
+      <dt>Frames received</dt><dd id="dFrames">—</dd>
+      <dt>Dropouts</dt><dd id="dDrops">—</dd>
+      <dt>Last frame</dt><dd id="dAge">—</dd>
+    </dl>
+  </section>
+
+  <section class="bay">
+    <span class="legend">Board</span>
+    <dl class="rows">
+      <dt>Firmware</dt><dd id="dFw">—</dd>
+      <dt>Board revision</dt><dd id="dRev">—</dd>
+      <dt>Active profile</dt><dd id="dProf">—</dd>
+      <dt>Serial speed</dt><dd id="dSerial">—</dd>
+      <dt>Loop cycle</dt><dd id="dCycle">—</dd>
+      <dt>I²C errors</dt><dd id="dI2c">—</dd>
+      <dt>Limits read from</dt><dd id="dLimits">—</dd>
+    </dl>
+  </section>
+
+  <!-- ── per-axis configuration ─────────────────────────────────────── -->
+  <section class="bay span-all">
+    <span class="legend">Profile <span id="dProfNum"></span> — per-axis configuration</span>
+    <div class="scroller">
+      <table class="sheet">
+        <thead><tr>
+          <th>Axis</th><th>P</th><th>I</th><th>D</th><th>Power</th><th>Poles</th>
+          <th>Invert</th><th>Limit min</th><th>Limit max</th>
+          <th>RC speed</th><th>Follow</th><th>Motor out</th>
+        </tr></thead>
+        <tbody id="axisBody">
+          <tr><td colspan="12" style="text-align:center;color:var(--legend)">Reading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <dl class="rows" style="margin-top:16px">
+      <dt>Gyro trust</dt><dd id="dGyro">—</dd>
+      <dt>PWM frequency</dt><dd id="dPwm">—</dd>
+      <dt>Acceleration limiter</dt><dd id="dAcc">—</dd>
+      <dt>Follow mode</dt><dd id="dFollow">—</dd>
+      <dt>Adaptive PID</dt><dd id="dAdaptive">—</dd>
+      <dt>Battery alarm</dt><dd id="dBatAlarm">—</dd>
+      <dt>Battery cutoff</dt><dd id="dBatCut">—</dd>
+    </dl>
+  </section>
+
+</div>
+
+<p class="footnote" id="footnote">—</p>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const PX_PER_DEG_PITCH = 2.6;
+const PX_PER_DEG_YAW   = 2.0;
+
+let armed = false, allowed = false, motorsOn = false, wasCalibrating = false;
+let lastLive = null;
+// The fast loop needs the limits without refetching them 20x a second.
+let lastLimits = { yaw_min: -180, yaw_max: 180, pitch_min: -180, pitch_max: 180,
+                   roll_min: -180, roll_max: 180 };
+
+/* ── instrument furniture, drawn once ───────────────────────────────── */
+
+(function buildLadder() {
+  let s = "";
+  for (let d = -90; d <= 90; d += 10) {
+    if (d === 0) continue;
+    const y = 100 - d * PX_PER_DEG_PITCH;
+    const half = (d % 20 === 0) ? 26 : 14;
+    s += `<line class="att-ladder" x1="${100 - half}" y1="${y}" x2="${100 + half}" y2="${y}"/>`;
+    if (d % 20 === 0) {
+      s += `<text class="att-ladder-text" x="${100 - half - 4}" y="${y + 2.5}" text-anchor="end">${Math.abs(d)}</text>`;
+      s += `<text class="att-ladder-text" x="${100 + half + 4}" y="${y + 2.5}" text-anchor="start">${Math.abs(d)}</text>`;
+    }
+  }
+  $("ladder").innerHTML = s;
+})();
+
+(function buildRollTicks() {
+  let s = "";
+  for (const a of [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60]) {
+    const major = (a % 30 === 0);
+    const rad = (a - 90) * Math.PI / 180;
+    const r0 = 74, r1 = major ? 66 : 70;
+    s += `<line class="${major ? 'att-tick-major' : 'att-tick'}"
+      x1="${(100 + r0 * Math.cos(rad)).toFixed(1)}" y1="${(100 + r0 * Math.sin(rad)).toFixed(1)}"
+      x2="${(100 + r1 * Math.cos(rad)).toFixed(1)}" y2="${(100 + r1 * Math.sin(rad)).toFixed(1)}"/>`;
+  }
+  $("rollTicks").innerHTML = s;
+})();
+
+/* ── per-axis dials ─────────────────────────────────────────────────── */
+
+/*
+ * One dial per axis, in the same idiom as the vendor GUI's gauges. Each is
+ * drawn once; only the needle transform changes per frame, so updating three
+ * dials costs three attribute writes rather than three SVG rebuilds.
+ */
+const DIALS = {
+  yaw:   { el: "dialYaw",   span: 180, built: false },
+  pitch: { el: "dialPitch", span: 90,  built: false },
+  roll:  { el: "dialRoll",  span: 90,  built: false },
+};
+
+// Map an angle to a dial rotation: 0deg points up, positive clockwise.
+const dialAngle = (v, span) => Math.max(-span, Math.min(span, v)) / span * 150;
+
+function buildDial(key) {
+  const d = DIALS[key], svg = $(d.el);
+  let s = `<circle class="dial-face" cx="65" cy="65" r="56"/>`;
+  // Allowed-range arc, filled in later by setDialRange().
+  s += `<path class="dial-band" id="${d.el}Band" d=""/>`;
+  s += `<path class="dial-allow" id="${d.el}Allow" d=""/>`;
+  for (let i = -150; i <= 150; i += 15) {
+    const major = i % 50 === 0 || i === 0;
+    const r = (i - 90) * Math.PI / 180, r0 = 56, r1 = major ? 46 : 51;
+    s += `<line class="${major ? 'dial-tick-major' : 'dial-tick'}"
+       x1="${(65 + r0 * Math.cos(r)).toFixed(1)}" y1="${(65 + r0 * Math.sin(r)).toFixed(1)}"
+       x2="${(65 + r1 * Math.cos(r)).toFixed(1)}" y2="${(65 + r1 * Math.sin(r)).toFixed(1)}"/>`;
+  }
+  for (const f of [-1, -0.5, 0, 0.5, 1]) {
+    const r = (f * 150 - 90) * Math.PI / 180;
+    s += `<text class="dial-label" x="${(65 + 38 * Math.cos(r)).toFixed(1)}"
+      y="${(65 + 38 * Math.sin(r) + 3).toFixed(1)}">${Math.round(f * d.span)}</text>`;
+  }
+  s += `<line class="dial-target" id="${d.el}Tgt" x1="65" y1="65" x2="65" y2="22"/>`;
+  s += `<line class="dial-needle" id="${d.el}Ndl" x1="65" y1="65" x2="65" y2="18"/>`;
+  s += `<circle class="dial-hub" cx="65" cy="65" r="3.5"/>`;
+  svg.innerHTML = s;
+  d.built = true;
+}
+
+function arcPath(fromDeg, toDeg, r) {
+  const p = a => {
+    const t = (a - 90) * Math.PI / 180;
+    return [(65 + r * Math.cos(t)).toFixed(2), (65 + r * Math.sin(t)).toFixed(2)];
+  };
+  const [x0, y0] = p(fromDeg), [x1, y1] = p(toDeg);
+  const large = Math.abs(toDeg - fromDeg) > 180 ? 1 : 0;
+  return `M${x0},${y0} A${r},${r} 0 ${large} 1 ${x1},${y1}`;
+}
+
+// Shade the operator's allowed range, so a limit is visible before you hit it.
+function setDialRange(key, min, max, on) {
+  const d = DIALS[key];
+  if (!d.built) buildDial(key);
+  $(d.el + "Band").setAttribute("d", arcPath(-150, 150, 56));
+  $(d.el + "Allow").setAttribute("d",
+    on ? arcPath(dialAngle(min, d.span), dialAngle(max, d.span), 56) : "");
+}
+
+function setDial(key, value, target, blocked) {
+  const d = DIALS[key];
+  if (!d.built) buildDial(key);
+  $(d.el + "Ndl").setAttribute("transform", `rotate(${dialAngle(value, d.span)} 65 65)`);
+  $(d.el + "Ndl").classList.toggle("blocked", !!blocked);
+  $(d.el + "Tgt").setAttribute("transform", `rotate(${dialAngle(target, d.span)} 65 65)`);
+}
+
+/* ── formatting ─────────────────────────────────────────────────────── */
+
+const deg = v => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1) + "°";
+
+function bearing(v) {
+  const h = ((v % 360) + 360) % 360;
+  const names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return [names[Math.round(h / 45) % 8], String(Math.round(h)).padStart(3, "0")];
+}
+
+function drawTape(yaw) {
+  const W = 300, C = W / 2;
+  let s = "";
+  const span = Math.ceil(C / PX_PER_DEG_YAW) + 20;
+  for (let d = Math.floor((yaw - span) / 5) * 5; d <= yaw + span; d += 5) {
+    const x = C + (d - yaw) * PX_PER_DEG_YAW;
+    if (x < -20 || x > W + 20) continue;
+    const major = ((d % 45) + 360) % 45 === 0;
+    s += `<line class="${major ? 'tape-tick-major' : 'tape-tick'}"
+      x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="${major ? 12 : 7}"/>`;
+    if (major) {
+      const [name, num] = bearing(d);
+      s += `<text class="tape-text" x="${x.toFixed(1)}" y="25">${name}</text>`;
+      s += `<text class="tape-text" x="${x.toFixed(1)}" y="35"
+             style="fill:var(--legend);font-size:8px">${num}</text>`;
+    }
+  }
+  $("tape").innerHTML = s;
+}
+
+function setInstrument(a, limits) {
+  $("ball").setAttribute("transform",
+    `rotate(${(-a.roll.imu).toFixed(2)} 100 100) translate(0 ${(a.pitch.imu * PX_PER_DEG_PITCH).toFixed(2)})`);
+  $("rollPointer").setAttribute("transform", `rotate(${(-a.roll.imu).toFixed(2)} 100 100)`);
+  drawTape(a.yaw.imu);
+
+  $("vYaw").textContent = deg(a.yaw.imu);
+  $("sYaw").textContent = bearing(a.yaw.imu).join(" ");
+  $("vPitch").textContent = deg(a.pitch.imu);
+  $("sPitch").textContent = "target " + deg(a.pitch.target);
+  $("vRoll").textContent = deg(a.roll.imu);
+  $("sRoll").textContent = "target " + deg(a.roll.target);
+
+  const out = (v, lo, hi) => (hi > lo) && (v < lo || v > hi);
+  $("figYaw").classList.toggle("out",   out(a.yaw.imu,   limits.yaw_min,   limits.yaw_max));
+  $("figPitch").classList.toggle("out", out(a.pitch.imu, limits.pitch_min, limits.pitch_max));
+  $("figRoll").classList.toggle("out",  out(a.roll.imu,  limits.roll_min,  limits.roll_max));
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   INPUT
+   Three sources — stick, keyboard, gamepad — all produce the same
+   normalised vector, and all follow one rule: you hold something to move,
+   and letting go stops. Nothing latches. The daemon enforces the same rule
+   with a watchdog, so a closed laptop lid or a dropped Wi-Fi link stops the
+   camera rather than leaving the last command running.
+   ───────────────────────────────────────────────────────────────────── */
+
+const intent = { pan: 0, tilt: 0, roll: 0 };
+let activeSource = null;          // "touch" | "keys" | "gamepad" | null
+let lastSent = { pan: 0, tilt: 0, roll: 0 }, lastSentAt = 0;
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body || ""
+  }).catch(() => null);
+}
+
+function setIntent(source, pan, tilt, roll) {
+  if (!armed) { pan = tilt = roll = 0; }
+  const moving = pan || tilt || roll;
+  /*
+   * First source to move owns the gimbal until it releases, so two inputs
+   * cannot fight. The ownership test deliberately does NOT depend on whether
+   * this particular call is a move or a release: guarding only moves let an
+   * unrelated input's release zero the intent of the source actually driving,
+   * so tapping a key mid-drag would stop the camera under your finger.
+   *
+   * A null source is the override used by disarm and link loss. It must never
+   * be blocked by ownership — those paths exist to force everything to zero.
+   */
+  if (source !== null && activeSource && activeSource !== source) return;
+  activeSource = moving ? source : null;
+  intent.pan = pan; intent.tilt = tilt; intent.roll = roll;
+  paintStick();
+}
+
+// Republish at 20 Hz while moving. The repeat is what keeps the daemon's
+// watchdog fed; stopping the repeat is itself the stop signal.
+setInterval(() => {
+  const moving = intent.pan || intent.tilt || intent.roll;
+  const changed = intent.pan !== lastSent.pan || intent.tilt !== lastSent.tilt ||
+                  intent.roll !== lastSent.roll;
+  const now = performance.now();
+  if (!armed) return;
+  if (moving || changed || (now - lastSentAt > 200 && (lastSent.pan || lastSent.tilt || lastSent.roll))) {
+    post("/api/control/rate",
+      `pan=${intent.pan.toFixed(3)}&tilt=${intent.tilt.toFixed(3)}&roll=${intent.roll.toFixed(3)}`);
+    lastSent = { ...intent };
+    lastSentAt = now;
+  }
+}, 50);
+
+/* ── stick (pointer events cover mouse, touch and pen alike) ────────── */
+
+const stick = $("stick"), knob = $("knob");
+let stickId = null;
+
+function paintStick() {
+  const r = stick.clientWidth / 2 - 33;
+  knob.style.transform = `translate(${(intent.pan * r).toFixed(1)}px, ${(-intent.tilt * r).toFixed(1)}px)`;
+  const live = !!(intent.pan || intent.tilt || intent.roll);
+  stick.classList.toggle("live", live);
+  $("ctlState").textContent = !allowed ? "disabled"
+                            : !armed   ? "safe"
+                            : live     ? "moving" : "armed · idle";
+  $("ctlState").classList.toggle("on", armed);
+}
+
+function stickVector(ev) {
+  const b = stick.getBoundingClientRect();
+  const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
+  const rad = b.width / 2 - 33;
+  let dx = (ev.clientX - cx) / rad, dy = (ev.clientY - cy) / rad;
+  const m = Math.hypot(dx, dy);
+  if (m > 1) { dx /= m; dy /= m; }          // clamp to the rim
+  const DEAD = 0.12;                         // ignore a resting finger
+  if (Math.hypot(dx, dy) < DEAD) return [0, 0];
+  return [dx, -dy];
+}
+
+stick.addEventListener("pointerdown", ev => {
+  if (!armed) return;
+  stickId = ev.pointerId;
+  // Act on the input first. Pointer capture is an improvement — it keeps
+  // tracking when the finger slides off the dial — but it can throw, and a
+  // control that silently does nothing because capture failed is worse than
+  // one that works without it.
+  const [x, y] = stickVector(ev);
+  setIntent("touch", x, y, 0);
+  try { stick.setPointerCapture(stickId); } catch (e) { /* track uncaptured */ }
+});
+stick.addEventListener("pointermove", ev => {
+  if (stickId !== ev.pointerId) return;
+  const [x, y] = stickVector(ev);
+  setIntent("touch", x, y, 0);
+});
+// Release is listened for on the window, not just the dial. Without pointer
+// capture a lift-off outside the dial would never reach it, and a missed
+// release means a rate that never stops.
+for (const e of ["pointerup", "pointercancel"]) {
+  addEventListener(e, ev => {
+    if (stickId === null || stickId !== ev.pointerId) return;
+    stickId = null;
+    setIntent("touch", 0, 0, 0);
+  });
+}
+
+/* ── keyboard ───────────────────────────────────────────────────────── */
+
+const held = new Set();
+// Roll is deliberately absent: it is a stabilised axis, held level by the
+// board, and there is no operator control for it.
+const KEYS = {
+  w: "up", arrowup: "up", s: "down", arrowdown: "down",
+  a: "left", arrowleft: "left", d: "right", arrowright: "right"
+};
+
+function applyKeys() {
+  const pan  = (held.has("right") ? 1 : 0) - (held.has("left") ? 1 : 0);
+  const tilt = (held.has("up") ? 1 : 0) - (held.has("down") ? 1 : 0);
+  setIntent("keys", pan, tilt, 0);
+}
+
+addEventListener("keydown", ev => {
+  const t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+  const k = ev.key.toLowerCase();
+
+  if (k === " ") { ev.preventDefault(); held.clear(); applyKeys(); post("/api/control/stop"); return; }
+  if (!armed) return;
+  // Holding a key makes the browser repeat keydown. home and level start an
+  // auto-task on the board, so a repeat restarts the move over and over and
+  // the gimbal judders. Only act on the initial press.
+  if (k === "h") { ev.preventDefault(); if (!ev.repeat) act("home");  return; }
+  if (k === "l") { ev.preventDefault(); if (!ev.repeat) act("level"); return; }
+
+  const dir = KEYS[k];
+  if (!dir || held.has(dir)) return;
+  ev.preventDefault();
+  held.add(dir);
+  applyKeys();
+});
+
+addEventListener("keyup", ev => {
+  const dir = KEYS[ev.key.toLowerCase()];
+  if (!dir) return;
+  held.delete(dir);
+  applyKeys();
+});
+
+// A window that loses focus can never deliver its keyup, which would leave a
+// key stuck down and the camera turning. Treat losing focus as release.
+addEventListener("blur", () => { held.clear(); applyKeys(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { held.clear(); applyKeys(); }
+});
+
+/* ── gamepad (attached to whichever machine is viewing the page) ────── */
+
+let padIndex = null;
+
+addEventListener("gamepadconnected", e => { padIndex = e.gamepad.index; });
+addEventListener("gamepaddisconnected", () => {
+  padIndex = null;
+  if (activeSource === "gamepad") setIntent("gamepad", 0, 0, 0);
+});
+
+function pollGamepad() {
+  requestAnimationFrame(pollGamepad);
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  let gp = null;
+  for (const p of pads) if (p && p.connected) { gp = p; break; }
+
+  const row = $("srcPad");
+  if (!gp) {
+    row.classList.remove("armed-src");
+    $("padHow").innerHTML = "Hold <kbd>LB</kbd>. Left stick pans, right stick tilts.";
+    return;
+  }
+  row.classList.add("armed-src");
+
+  // LB is the deadman, matching the CLI's gamepad mode so the two behave the
+  // same way. Nothing moves unless it is held.
+  const dead = gp.buttons[4] && gp.buttons[4].pressed;
+  const boost = gp.buttons[5] && gp.buttons[5].pressed ? 2 : 1;
+  $("padHow").textContent = gp.id.slice(0, 32) + (dead ? " · LB held" : " · hold LB · L=pan R=tilt");
+
+  if (!armed) return;
+  if (!dead) { if (activeSource === "gamepad") setIntent("gamepad", 0, 0, 0); return; }
+
+  const DEAD = 0.14;
+  const ax = v => (Math.abs(v) < DEAD ? 0 : (v - Math.sign(v) * DEAD) / (1 - DEAD));
+  const clamp = v => Math.max(-1, Math.min(1, v));
+
+  // One axis per stick: left stick left/right is yaw, right stick up/down is
+  // pitch. Splitting them this way means a thumb slipping sideways on the
+  // right stick cannot tilt the camera, and vice versa.
+  const pan  = clamp(ax(gp.axes[0] || 0) * boost);
+  const tilt = clamp(-ax(gp.axes[3] !== undefined ? gp.axes[3] : gp.axes[1] || 0) * boost);
+  setIntent("gamepad", pan, tilt, 0);   // roll is never operator-driven
+
+  // Edge-triggered, not level-triggered. getGamepads() is polled every frame,
+  // so testing .pressed directly would re-issue home 60 times a second while
+  // the button is down and leave the gimbal restarting the move continuously.
+  edgePress(gp, 0, () => act("home"));
+  edgePress(gp, 1, () => act("level"));
+}
+
+const padPrev = {};
+function edgePress(gp, index, fn) {
+  const now = !!(gp.buttons[index] && gp.buttons[index].pressed);
+  if (now && !padPrev[index]) fn();
+  padPrev[index] = now;
+}
+requestAnimationFrame(pollGamepad);
+
+/* ── discrete actions ───────────────────────────────────────────────── */
+
+// A press must never be silent. Without this the only way to tell a working
+// button from a dead one is to watch the camera — and with motors off, or a
+// zero-power axis, a perfectly good command looks broken.
+let toastTimer = null;
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (kind ? " " + kind : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = "toast"; }, 2200);
+}
+
+const LABEL = {
+  stop: "Stop sent", home: "Going home", level: "Levelling",
+  sethome: "Home position taught", clearhome: "Taught home cleared",
+  calibgyro: "Calibrating gyro — hold still", motors: "Motors"
+};
+
+// Debounced per action, not globally: pressing home and then level in quick
+// succession are two different intentions and both should be honoured.
+const lastAct = {};
+async function act(what) {
+  const now = performance.now();
+  if (now - (lastAct[what] || 0) < 400) return;
+  lastAct[what] = now;
+
+  const body = what === "motors" ? "on=" + (motorsOn ? "0" : "1") : "";
+  const res = await post("/api/control/" + what, body);
+  if (!res) { toast("Could not reach the daemon", "bad"); return; }
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    toast(j.reason || ("Refused (HTTP " + res.status + ")"), "bad");
+    return;
+  }
+  let msg = what === "motors"
+    ? (motorsOn ? "Motors off" : "Motors on")
+    : (LABEL[what] || what);
+  // Say plainly when the command went out but cannot do anything yet.
+  if (!motorsOn && (what === "home" || what === "level"))
+    msg += " — but motors are off, so nothing will move";
+  toast(msg, "good");
+  poll();
+}
+
+for (const b of document.querySelectorAll(".actions .btn")) {
+  b.addEventListener("click", () => {
+    // Calibration is destructive if the gimbal is not still: the board would
+    // learn a wrong zero-rate bias and drift afterwards. Say so before doing it.
+    if (b.dataset.act === "calibgyro" && !confirm(
+        "Calibrate the gyroscope?\n\n" +
+        "The gimbal must stay completely still until it finishes. " +
+        "Calibrating while it moves teaches the board a wrong bias and the " +
+        "camera will drift afterwards.")) return;
+    act(b.dataset.act);
+  });
+}
+
+$("limApply").addEventListener("click", async () => {
+  const body = "enabled=" + ($("limOn").checked ? "1" : "0") +
+    "&yaw_min=" + $("limYawMin").value + "&yaw_max=" + $("limYawMax").value +
+    "&pitch_min=" + $("limPitchMin").value + "&pitch_max=" + $("limPitchMax").value;
+  const res = await post("/api/limits", body);
+  if (!res) return void toast("Could not reach the daemon", "bad");
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    return void toast(j.reason || "Limits rejected", "bad");
+  }
+  toast($("limOn").checked ? "Limits applied" : "Limits turned off", "good");
+  poll();
+});
+
+$("portBtn").addEventListener("click", async () => {
+  const path = $("portSel").value;
+  if (!path) return;
+  const res = await post("/api/port", "path=" + encodeURIComponent(path));
+  if (res && !res.ok) {
+    const j = await res.json().catch(() => ({}));
+    alert(j.reason || "Could not switch port.");
+  }
+  poll();
+});
+
+$("speed").addEventListener("input", ev => {
+  $("speedVal").textContent = ev.target.value + " °/s";
+});
+$("speed").addEventListener("change", ev => post("/api/control/speed", "deg_s=" + ev.target.value));
+
+$("armBtn").addEventListener("click", async () => {
+  const arming = !armed;
+  if (arming && !confirm(
+      "Arming lets this page move the gimbal.\n\n" +
+      "Check that the camera is clear of obstructions before continuing.")) return;
+  held.clear();
+  setIntent(null, 0, 0, 0);
+  await post("/api/arm", "armed=" + (arming ? "1" : "0"));
+  poll();
+});
+
+/* ── messages / lamps / sheet ───────────────────────────────────────── */
+
+function lamp(id, state, sub) {
+  $(id).className = "lamp" + (state === "off" ? "" : " lit-" + state);
+  $(id + "Sub").textContent = sub;
+}
+
+const TAG = { danger: "WARN", warn: "CAUTION", info: "ADVISORY" };
+const CLS = { danger: "alarm", warn: "caution", info: "advisory" };
+const RANK = { danger: 0, warn: 1, info: 2 };
+
+function setMessages(list) {
+  const box = $("messages");
+  box.textContent = "";
+  if (!list.length) {
+    const d = document.createElement("div");
+    d.className = "msg-none";
+    d.textContent = "No active messages. All monitored conditions are normal.";
+    box.appendChild(d);
+    return;
+  }
+  for (const m of [...list].sort((a, b) => RANK[a.level] - RANK[b.level])) {
+    const row = document.createElement("div");
+    row.className = "msg " + (CLS[m.level] || "advisory");
+    const tag = document.createElement("span");
+    tag.className = "tag"; tag.textContent = TAG[m.level] || "NOTE";
+    const txt = document.createElement("span"); txt.textContent = m.text;
+    row.append(tag, txt);
+    box.appendChild(row);
+  }
+}
+
+function setAxisSheet(p) {
+  $("dProfNum").textContent = p.valid ? p.number : "";
+  const body = $("axisBody");
+  body.textContent = "";
+  if (!p.valid) {
+    const td = body.insertRow().insertCell();
+    td.colSpan = 12; td.style.textAlign = "center"; td.style.color = "var(--legend)";
+    td.textContent = "No profile data received yet.";
+    return;
+  }
+  for (const [label, key] of [["Roll", "roll"], ["Pitch", "pitch"], ["Yaw", "yaw"]]) {
+    const a = p.axes[key];
+    if (!a) continue;
+    const tr = body.insertRow();
+    const noLimit = (a.rc_min_angle === 0 && a.rc_max_angle === 0);
+    for (const c of [label, a.p, a.i, a.d, a.power, a.poles, a.invert ? "yes" : "no",
+                     noLimit ? "—" : a.rc_min_angle + "°",
+                     noLimit ? "—" : a.rc_max_angle + "°",
+                     a.rc_speed, a.follow_speed, a.motor_output])
+      tr.insertCell().textContent = c;
+  }
+}
+
+/* ── render ─────────────────────────────────────────────────────────── */
+
+function render(s) {
+  const t = s.telemetry, L = s.limits, ctl = s.control;
+
+  const wasArmed = armed;
+  allowed = ctl.allowed;
+  armed = ctl.allowed && ctl.armed;
+  if (wasArmed && !armed) { held.clear(); setIntent(null, 0, 0, 0); }
+
+  const mode = $("pMode");
+  if (armed)        { mode.textContent = "Control armed"; mode.className = "plate hot"; }
+  else if (!allowed){ mode.textContent = "Read-only";     mode.className = "plate safe"; }
+  else              { mode.textContent = "Safe";          mode.className = "plate"; }
+  // by-id paths are long enough to crowd the masthead off screen; the leaf
+  // name identifies the adapter just as well, and the full path is in Link.
+  const shortPort = s.link.port.replace(/^\/dev\/serial\/by-id\//, "");
+  $("pLink").textContent = shortPort + " · " + s.link.baud + " Bd";
+  $("pLink").title = s.link.port;
+
+  // control affordances
+  const arm = $("armBtn");
+  arm.disabled = !allowed;
+  arm.textContent = armed ? "Disarm control" : "Arm control";
+  arm.className = "btn" + (armed ? " arm-on" : "");
+  $("ctlNote").textContent = !allowed
+    ? "This session is read-only. The daemon was started without --allow-control, so it cannot send a motion command at all. Restart it with --allow-control to enable arming."
+    : armed
+      ? "Hold a control to move; let go and the camera stops. If this page stops responding, the gimbal stops on its own within half a second."
+      : "Arm control to move the camera. Nothing can move the gimbal until you do.";
+
+  stick.classList.toggle("off", !armed);
+  $("stickHint").textContent = armed ? "Drag to move · release to stop"
+                                     : (allowed ? "Arm to enable" : "Read-only");
+  $("speed").disabled = !armed;
+  for (const b of document.querySelectorAll(".actions .btn")) b.disabled = !armed;
+  if (!document.activeElement || document.activeElement !== $("speed")) {
+    $("speed").value = ctl.speed_deg_s;
+    $("speedVal").textContent = ctl.speed_deg_s + " °/s";
+  }
+  motorsOn = !!(t.valid && t.motors_on);
+  $("motorBtn").textContent = motorsOn ? "Motors off" : "Motors on";
+
+  // Clearing only means something once a home has actually been taught.
+  // "Go home" is always available — that is the button for returning.
+  $("clearHomeBtn").disabled = !armed || !ctl.custom_home;
+  $("homeHint").textContent = ctl.custom_home
+    ? `Home: taught position — yaw ${ctl.home_yaw}°, pitch ${ctl.home_pitch}°. Roll is always level.`
+    : "Home: the board's built-in position. Roll is always level.";
+
+  // Calibration progress, so "keep still" has a visible end.
+  const box = $("calibBox");
+  if (ctl.calib_running) {
+    box.hidden = false;
+    const pct = Math.min(100, (ctl.calib_elapsed / ctl.calib_total) * 100);
+    $("calibBar").style.width = pct.toFixed(0) + "%";
+    $("calibCount").textContent =
+      Math.max(0, ctl.calib_total - ctl.calib_elapsed).toFixed(1) + " s left";
+    wasCalibrating = true;
+  } else {
+    box.hidden = true;
+    if (wasCalibrating) { wasCalibrating = false; toast("Gyro calibration finished", "good"); }
+  }
+
+  // What actually went on the wire. Turns "the button did nothing" into a
+  // question with an answer.
+  $("lastCmd").textContent = ctl.last_cmd
+    ? `Last command: ${ctl.last_cmd}  ·  ${ctl.last_cmd_age.toFixed(1)}s ago  ·  ${ctl.last_cmd_hex}`
+    : "";
+
+  paintStick();
+
+  // annunciators
+  if (!s.link.port_open)             lamp("lampLink", "alarm", "port closed");
+  else if (!s.link.board_responding) lamp("lampLink", "alarm", "no reply");
+  else                               lamp("lampLink", "live", "connected");
+
+  if (!t.valid)         lamp("lampMotors", "off", "unknown");
+  else if (t.motors_on) lamp("lampMotors", "live", "powered");
+  else                  lamp("lampMotors", "caution", "off · limp");
+
+  if (!t.valid || t.battery_volts < 0.5) lamp("lampBatt", "off", "unknown");
+  else {
+    const al = s.profile.valid ? s.profile.bat_alarm_v : 0;
+    lamp("lampBatt", (al > 0 && t.battery_volts < al) ? "alarm" : "live",
+         t.battery_volts.toFixed(2) + " V");
+  }
+
+  if (!t.valid)          lamp("lampFault", "off", "unknown");
+  else if (t.error_code) lamp("lampFault", "caution", "error " + t.error_code);
+  else if (t.i2c_errors) lamp("lampFault", "caution", t.i2c_errors + " I²C errors");
+  else                   lamp("lampFault", "live", "no faults");
+
+  // The daemon reports a pad wired to the robot; the browser reports one
+  // wired to whatever is viewing the page. Either can fly the camera.
+  const hostPad = s.controller.present, browserPad = padIndex !== null ||
+        [...(navigator.getGamepads ? navigator.getGamepads() : [])].some(p => p && p.connected);
+  lamp("lampPad", (hostPad || browserPad) ? "live" : "off",
+       browserPad ? "this browser" : hostPad ? (s.controller.name || "on robot") : "not detected");
+
+  lamp("lampRc", !t.valid ? "off" : (t.rc_signal ? "live" : "off"),
+       !t.valid ? "unknown" : (t.rc_signal ? "signal present" : "no signal"));
+
+  // Instruments are driven by pollLive() at 20 Hz; this loop only supplies
+  // the limit ranges they draw against.
+  lastLimits = L;
+  setDialRange("yaw",   ctl.lim_yaw_min,   ctl.lim_yaw_max,   ctl.limits_on);
+  setDialRange("pitch", ctl.lim_pitch_min, ctl.lim_pitch_max, ctl.limits_on);
+  setDialRange("roll",  -5, 5, true);
+  if (!lastLive && t.valid && t.angles && t.angles.yaw) setInstrument(t.angles, L);
+
+  // Repopulate the picker only when the set of devices actually changed, so
+  // the 4 Hz poll cannot yank a selection out from under the operator.
+  const sel = $("portSel");
+  const sig = (s.link.ports || []).map(p => p.path).join("|");
+  if (sig !== sel.dataset.sig) {
+    sel.dataset.sig = sig;
+    const keep = sel.value;
+    sel.textContent = "";
+    for (const p of s.link.ports || []) {
+      const o = document.createElement("option");
+      o.value = p.path;
+      o.textContent = p.label + (p.stable ? "" : "  (renumbers on re-plug)");
+      sel.appendChild(o);
+    }
+    if (!s.link.ports || !s.link.ports.length) {
+      const o = document.createElement("option");
+      o.textContent = "no serial devices found";
+      o.value = "";
+      sel.appendChild(o);
+    }
+    // Keep the operator's pick if it survived; otherwise show what is in use.
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : s.link.port;
+  }
+  $("portNote").textContent = s.link.note || "";
+
+  $("dPort").textContent = s.link.port_open ? "open" : (s.link.error || "closed");
+  $("dPort").className = s.link.port_open ? "" : "bad";
+  $("dBaud").textContent = s.link.baud;
+  $("dFrames").textContent = s.link.frames_rx;
+  $("dDrops").textContent = s.link.timeouts;
+  $("dDrops").className = s.link.timeouts ? "warn" : "";
+  $("dAge").textContent = s.link.last_frame_age_s.toFixed(2) + " s ago";
+
+  $("dFw").textContent = s.board.known ? s.board.firmware : "—";
+  $("dRev").textContent = s.board.known ? s.board.board_version : "—";
+  $("dProf").textContent = t.valid ? t.cur_profile : "—";
+  $("dSerial").textContent = s.profile.valid ? s.profile.serial_speed + " Bd" : "—";
+  $("dCycle").textContent = t.valid ? t.cycle_time_us + " µs" : "—";
+  $("dI2c").textContent = t.valid ? t.i2c_errors : "—";
+  $("dI2c").className = (t.valid && t.i2c_errors) ? "warn" : "";
+  $("dLimits").textContent = L.source;
+  $("dLimits").className = L.source === "board" ? "" : "warn";
+
+  setAxisSheet(s.profile);
+  if (s.profile.valid) {
+    const p = s.profile;
+    $("dGyro").textContent = p.gyro_trust;
+    $("dPwm").textContent = p.pwm_freq;
+    $("dAcc").textContent = p.acc_limiter_all;
+    $("dFollow").textContent = "mode " + p.follow_mode + " · deadband " +
+      p.follow_deadband + " · expo " + p.follow_expo_rate;
+    $("dAdaptive").textContent = p.adaptive_pid_enabled ? "on" : "off";
+    $("dBatAlarm").textContent = p.bat_alarm_v > 0 ? p.bat_alarm_v.toFixed(2) + " V" : "not set";
+    $("dBatCut").textContent = p.bat_motors_v > 0 ? p.bat_motors_v.toFixed(2) + " V" : "not set";
+  }
+
+  // Do not overwrite a field the operator is typing into.
+  const focused = document.activeElement;
+  const fill = (id, v) => { if (focused !== $(id)) $(id).value = v; };
+  if (focused !== $("limOn")) $("limOn").checked = !!ctl.limits_on;
+  fill("limYawMin", ctl.lim_yaw_min);
+  fill("limYawMax", ctl.lim_yaw_max);
+  fill("limPitchMin", ctl.lim_pitch_min);
+  fill("limPitchMax", ctl.lim_pitch_max);
+
+  setMessages(s.warnings || []);
+  $("footnote").textContent = s.config_summary || "";
+}
+
+/* ── polling ────────────────────────────────────────────────────────── */
+
+async function poll() {
+  const live = $("pLive");
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+    live.textContent = "Live"; live.className = "plate safe";
+  } catch (e) {
+    live.textContent = "Daemon unreachable"; live.className = "plate stale";
+    // Stop trying to drive something we can no longer talk to.
+    armed = false; held.clear(); setIntent(null, 0, 0, 0);
+    setMessages([{ level: "danger",
+      text: "This page cannot reach gimbal_gui. The daemon may have stopped. " +
+            "The gimbal stops by itself when commands stop arriving." }]);
+  }
+}
+
+/*
+ * Two loops at different rates.
+ *
+ * The instruments were previously driven by the full status document at 4 Hz,
+ * which is why the horizon lagged — each update also carried the profile
+ * table, the warning list and the port enumeration, none of which change at
+ * that speed. The gauges now ride a small angles-only payload at 20 Hz, and
+ * the heavy document stays at 4 Hz where it belongs.
+ */
+async function pollLive() {
+  try {
+    const r = await fetch("/api/live", { cache: "no-store" });
+    if (!r.ok) return;
+    const a = await r.json();
+    if (!a.valid) return;
+
+    lastLive = a;
+    setInstrument(
+      { yaw:   { imu: a.yaw,   target: a.yaw_t },
+        pitch: { imu: a.pitch, target: a.pitch_t },
+        roll:  { imu: a.roll,  target: a.roll_t } },
+      lastLimits);
+
+    setDial("yaw",   a.yaw,   a.yaw_t,   a.blocked_yaw);
+    setDial("pitch", a.pitch, a.pitch_t, a.blocked_pitch);
+    setDial("roll",  a.roll,  a.roll_t,  false);
+    $("dYawVal").textContent   = deg(a.yaw);
+    $("dPitchVal").textContent = deg(a.pitch);
+    $("dRollVal").textContent  = deg(a.roll);
+  } catch (e) { /* the 4 Hz status poll reports connection trouble */ }
+}
+
+poll();
+setInterval(poll, 250);
+pollLive();
+setInterval(pollLive, 50);
+</script>
+</body>
+</html>
