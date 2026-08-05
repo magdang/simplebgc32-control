@@ -486,16 +486,20 @@ body {
       <label class="lim-toggle">
         <input type="checkbox" id="limOn"> <span>Enforce limits</span>
       </label>
+      <!-- step matches what the daemon stores and reports, a tenth of a
+           degree, so a typed value cannot come back as a different number. -->
       <span class="lim-field"><span class="legend">Yaw min</span>
-        <input type="number" id="limYawMin" step="1" min="-180" max="180"></span>
+        <input type="number" id="limYawMin" step="0.1" min="-180" max="180"></span>
       <span class="lim-field"><span class="legend">Yaw max</span>
-        <input type="number" id="limYawMax" step="1" min="-180" max="180"></span>
+        <input type="number" id="limYawMax" step="0.1" min="-180" max="180"></span>
       <span class="lim-field"><span class="legend">Pitch min</span>
-        <input type="number" id="limPitchMin" step="1" min="-180" max="180"></span>
+        <input type="number" id="limPitchMin" step="0.1" min="-180" max="180"></span>
       <span class="lim-field"><span class="legend">Pitch max</span>
-        <input type="number" id="limPitchMax" step="1" min="-180" max="180"></span>
+        <input type="number" id="limPitchMax" step="0.1" min="-180" max="180"></span>
       <button class="btn" id="limApply">Apply</button>
     </div>
+    <p class="note" id="limNote" hidden>Edited — nothing changes until you press
+      Apply.</p>
   </section>
 
   <!-- ── link + board ───────────────────────────────────────────────── -->
@@ -734,6 +738,16 @@ const intent = { pan: 0, tilt: 0, roll: 0 };
 let activeSource = null;          // "touch" | "keys" | "gamepad" | null
 let lastSent = { pan: 0, tilt: 0, roll: 0 }, lastSentAt = 0;
 
+/*
+ * Sources a stop is still holding down. A stop that only zeroed `intent` would
+ * be undone within one frame by whatever is still physically held: keydown
+ * auto-repeats, pointermove keeps firing, and the gamepad is re-read every
+ * animation frame. Each source here is refused until it is actually released,
+ * which is what makes a stop stay stopped while a thumb is still on the stick.
+ */
+const stopLatched = new Set();
+let padDeadHeld = false;          // gamepad LB, tracked so stop can latch it
+
 function post(path, body) {
   return fetch(path, {
     method: "POST",
@@ -745,6 +759,11 @@ function post(path, body) {
 function setIntent(source, pan, tilt, roll) {
   if (!armed) { pan = tilt = roll = 0; }
   const moving = pan || tilt || roll;
+
+  // A stop this source has not yet been released from. Null is the override
+  // used by stop, disarm and link loss, and is never blocked.
+  if (source !== null && stopLatched.has(source)) return;
+
   /*
    * First source to move owns the gimbal until it releases, so two inputs
    * cannot fight. The ownership test deliberately does NOT depend on whether
@@ -826,6 +845,9 @@ stick.addEventListener("pointermove", ev => {
 // release means a rate that never stops.
 for (const e of ["pointerup", "pointercancel"]) {
   addEventListener(e, ev => {
+    // The lift is also what releases the dial from a stop, so it is processed
+    // even when stopLocal() has already cleared stickId.
+    stopLatched.delete("touch");
     if (stickId === null || stickId !== ev.pointerId) return;
     stickId = null;
     setIntent("touch", 0, 0, 0);
@@ -853,7 +875,10 @@ addEventListener("keydown", ev => {
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
   const k = ev.key.toLowerCase();
 
-  if (k === " ") { ev.preventDefault(); held.clear(); applyKeys(); post("/api/control/stop"); return; }
+  // The panic key. Routed through act() so it clears this page's own intent
+  // as well as the daemon's — posting alone leaves the republisher resending
+  // whatever is still held. Auto-repeat is ignored; one press is one stop.
+  if (k === " ") { ev.preventDefault(); if (!ev.repeat) act("stop"); return; }
   if (!armed) return;
   // Holding a key makes the browser repeat keydown. home and level start an
   // auto-task on the board, so a repeat restarts the move over and over and
@@ -872,14 +897,21 @@ addEventListener("keyup", ev => {
   const dir = KEYS[ev.key.toLowerCase()];
   if (!dir) return;
   held.delete(dir);
+  // Every movement key up: the keyboard has let go of the stop it was under.
+  if (!held.size) stopLatched.delete("keys");
   applyKeys();
 });
 
 // A window that loses focus can never deliver its keyup, which would leave a
 // key stuck down and the camera turning. Treat losing focus as release.
-addEventListener("blur", () => { held.clear(); applyKeys(); });
+const releaseKeys = () => {
+  held.clear();
+  stopLatched.delete("keys");
+  applyKeys();
+};
+addEventListener("blur", releaseKeys);
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) { held.clear(); applyKeys(); }
+  if (document.hidden) releaseKeys();
 });
 
 /* ── gamepad (attached to whichever machine is viewing the page) ────── */
@@ -889,6 +921,8 @@ let padIndex = null;
 addEventListener("gamepadconnected", e => { padIndex = e.gamepad.index; });
 addEventListener("gamepaddisconnected", () => {
   padIndex = null;
+  padDeadHeld = false;
+  stopLatched.delete("gamepad");
   if (activeSource === "gamepad") setIntent("gamepad", 0, 0, 0);
 });
 
@@ -901,6 +935,8 @@ function pollGamepad() {
   const row = $("srcPad");
   if (!gp) {
     row.classList.remove("armed-src");
+    padDeadHeld = false;
+    stopLatched.delete("gamepad");
     $("padHow").innerHTML = "Hold <kbd>LB</kbd>. Left stick pans, right stick tilts.";
     return;
   }
@@ -910,10 +946,16 @@ function pollGamepad() {
   // same way. Nothing moves unless it is held.
   const dead = gp.buttons[4] && gp.buttons[4].pressed;
   const boost = gp.buttons[5] && gp.buttons[5].pressed ? 2 : 1;
+  padDeadHeld = !!dead;
   $("padHow").textContent = gp.id.slice(0, 32) + (dead ? " · LB held" : " · hold LB · L=pan R=tilt");
 
   if (!armed) return;
-  if (!dead) { if (activeSource === "gamepad") setIntent("gamepad", 0, 0, 0); return; }
+  if (!dead) {
+    // Letting go of the deadman is what releases the pad from a stop.
+    stopLatched.delete("gamepad");
+    if (activeSource === "gamepad") setIntent("gamepad", 0, 0, 0);
+    return;
+  }
 
   const DEAD = 0.14;
   const ax = v => (Math.abs(v) < DEAD ? 0 : (v - Math.sign(v) * DEAD) / (1 - DEAD));
@@ -961,13 +1003,37 @@ const LABEL = {
   calibgyro: "Calibrating gyro — hold still", motors: "Motors"
 };
 
+/*
+ * Take the stop effect on this page, immediately and without waiting for the
+ * round-trip. POSTing /api/control/stop is only half a stop: the republisher
+ * above resends whatever `intent` still holds, so a held control would put the
+ * rate back within 50 ms and the camera would carry on as though nothing had
+ * been pressed. Anything engaged right now is latched until it is released.
+ */
+function stopLocal() {
+  if (held.size)        stopLatched.add("keys");
+  if (stickId !== null) stopLatched.add("touch");
+  if (padDeadHeld)      stopLatched.add("gamepad");
+
+  held.clear();
+  stickId = null;
+  setIntent(null, 0, 0, 0);
+}
+
 // Debounced per action, not globally: pressing home and then level in quick
 // succession are two different intentions and both should be honoured.
 const lastAct = {};
 async function act(what) {
   const now = performance.now();
-  if (now - (lastAct[what] || 0) < 400) return;
-  lastAct[what] = now;
+  // Stop is exempt from the debounce and acts before the network call. It is
+  // idempotent, so repeating it costs nothing, and a panic control that
+  // ignores the operator's second press in a row is not one.
+  if (what === "stop") {
+    stopLocal();
+  } else {
+    if (now - (lastAct[what] || 0) < 400) return;
+    lastAct[what] = now;
+  }
 
   const body = what === "motors" ? "on=" + (motorsOn ? "0" : "1") : "";
   const res = await post("/api/control/" + what, body);
@@ -1000,6 +1066,29 @@ for (const b of document.querySelectorAll(".actions .btn")) {
   });
 }
 
+/*
+ * Limit controls the operator has changed since the last Apply. The 4 Hz poll
+ * rewrites this panel from the daemon, and exempting only the control that
+ * happens to have focus is not enough: the moment you tab out of "Yaw min" to
+ * type a second field, the next poll restores the stored value, and Apply then
+ * sends back the number that was restored. Only the last-touched field would
+ * ever take effect. An edit therefore stands until it is applied or discarded.
+ */
+const limDirty = new Set();
+const LIM_IDS = ["limOn", "limYawMin", "limYawMax", "limPitchMin", "limPitchMax"];
+
+function setLimDirty(id) {
+  limDirty.add(id);
+  $("limNote").hidden = false;
+}
+function clearLimDirty() {
+  limDirty.clear();
+  $("limNote").hidden = true;
+}
+for (const id of LIM_IDS)
+  for (const e of ["input", "change"])
+    $(id).addEventListener(e, () => setLimDirty(id));
+
 $("limApply").addEventListener("click", async () => {
   const body = "enabled=" + ($("limOn").checked ? "1" : "0") +
     "&yaw_min=" + $("limYawMin").value + "&yaw_max=" + $("limYawMax").value +
@@ -1007,9 +1096,12 @@ $("limApply").addEventListener("click", async () => {
   const res = await post("/api/limits", body);
   if (!res) return void toast("Could not reach the daemon", "bad");
   if (!res.ok) {
+    // Keep the edits: they are what the operator meant, and discarding them
+    // on a rejection would mean retyping all four to fix one.
     const j = await res.json().catch(() => ({}));
     return void toast(j.reason || "Limits rejected", "bad");
   }
+  clearLimDirty();
   toast($("limOn").checked ? "Limits applied" : "Limits turned off", "good");
   poll();
 });
@@ -1131,7 +1223,11 @@ function render(s) {
   $("stickHint").textContent = armed ? "Drag to move · release to stop"
                                      : (allowed ? "Arm to enable" : "Read-only");
   $("speed").disabled = !armed;
-  for (const b of document.querySelectorAll(".actions .btn")) b.disabled = !armed;
+  // Stop is the exception: it stays live whenever the daemon can send at all,
+  // armed or not. The daemon deliberately lets a stop through without arming,
+  // and greying out the panic control would take that back.
+  for (const b of document.querySelectorAll(".actions .btn"))
+    b.disabled = !armed && !(b.dataset.act === "stop" && allowed);
   if (!document.activeElement || document.activeElement !== $("speed")) {
     $("speed").value = ctl.speed_deg_s;
     $("speedVal").textContent = ctl.speed_deg_s + " °/s";
@@ -1263,10 +1359,12 @@ function render(s) {
     $("dBatCut").textContent = p.bat_motors_v > 0 ? p.bat_motors_v.toFixed(2) + " V" : "not set";
   }
 
-  // Do not overwrite a field the operator is typing into.
+  // Do not overwrite an edit waiting to be applied, or a field being typed
+  // into right now. Everything else tracks the daemon.
   const focused = document.activeElement;
-  const fill = (id, v) => { if (focused !== $(id)) $(id).value = v; };
-  if (focused !== $("limOn")) $("limOn").checked = !!ctl.limits_on;
+  const held_ = id => limDirty.has(id) || focused === $(id);
+  const fill = (id, v) => { if (!held_(id)) $(id).value = v; };
+  if (!held_("limOn")) $("limOn").checked = !!ctl.limits_on;
   fill("limYawMin", ctl.lim_yaw_min);
   fill("limYawMax", ctl.lim_yaw_max);
   fill("limPitchMin", ctl.lim_pitch_min);

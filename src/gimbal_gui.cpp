@@ -8,7 +8,8 @@
  * ------------------------------------------------------------- read-only --
  * By default this program CANNOT move the gimbal. Every serial command it
  * sends goes through send_query(), which refuses any command ID that is not on
- * a whitelist of pure queries. Motion requires two independent unlocks:
+ * a whitelist of pure queries. Operator-commanded motion requires two
+ * independent unlocks:
  *
  *   1. the binary must be started with --allow-control, and
  *   2. the operator must arm the control toggle in the UI.
@@ -16,6 +17,14 @@
  * With either missing, the control endpoints answer 403 and no frame is built.
  * The default posture is monitor-only, which is what you want while a camera
  * is bolted to the thing.
+ *
+ * ONE thing is written without the second unlock: the gyro calibration that
+ * runs when the motors are switched on. It is gated on --allow-control like
+ * everything else, and it is listed here rather than buried because a reader
+ * checking whether this program can write to the board deserves the whole
+ * answer. Arming exists to gate motion the OPERATOR commands, and this
+ * commands none: it waits for the gimbal to be still, and the serial loop
+ * suppresses every rate for its duration. See "calibrate on power" below.
  *
  * ------------------------------------------------------------- zero-args --
  * Run it with no arguments. Port, baud and axis limits are recovered from an
@@ -93,10 +102,14 @@ struct Options {
     std::string gui_dir;               // explicit SimpleBGC GUI install
     bool        allow_control = false; // arms the control unlock
     bool        no_pad = false;
-    // On by default: a gimbal that has not zeroed its gyro drifts, and the
-    // operator asked for one less thing to remember. Opt out with
-    // --no-calib-gyro. Still requires --allow-control, since it writes.
-    bool        calib_gyro_on_start = true;
+    /*
+     * Calibrate the gyro every time the motors come on. On by default: a
+     * gimbal that has not zeroed its gyro drifts, powering the motors is what
+     * invalidates the stored bias, and the operator asked for one less thing
+     * to remember. Opt out with --no-calib-gyro. Still requires
+     * --allow-control, since it writes.
+     */
+    bool        calib_gyro_on_motors = true;
 };
 
 /*
@@ -121,6 +134,14 @@ struct Status {
     // live telemetry
     bool            have_rt = false;
     sbgc_realtime_t rt{};
+    /*
+     * When `rt` last arrived. have_rt only ever latches true, so on its own it
+     * says "an angle was read at some point", not "this angle is current". A
+     * board whose TX path dies while it still accepts commands keeps the last
+     * reading frozen and perfectly plausible, which is exactly the case the
+     * travel limits must not be evaluated against.
+     */
+    double          rt_stamp = 0.0;
 
     // configuration of the active profile
     bool          have_params = false;
@@ -155,6 +176,13 @@ struct Status {
     AxisLimits user_pitch{ -50.0, 45.0 };
     AxisLimits user_yaw{ -170.0, 170.0 };
     bool       limit_blocked_pitch = false, limit_blocked_yaw = false;
+    /*
+     * Limits are on but there is no current angle to check them against, so
+     * motion is being held rather than allowed through unchecked. Reported
+     * separately from the per-axis blocks: "at the limit" and "cannot tell
+     * where the camera is" are different situations with different fixes.
+     */
+    bool       limit_stale = false;
 
     // control gating
     bool control_allowed = false;   // --allow-control was passed
@@ -171,6 +199,15 @@ struct Status {
     double intent_pan = 0.0, intent_tilt = 0.0, intent_roll = 0.0;
     double intent_stamp = 0.0;
     bool   motion_active = false;   // a non-zero rate is currently commanded
+    /*
+     * A home or level AUTO_TASK we started and the board is still running.
+     * Tracked apart from motion_active because the two are ended by different
+     * commands, and because clearing motion_active for a task — which is what
+     * keeps the watchdog from cancelling it — used to mean a disarm mid-slew
+     * saw nothing in flight and sent nothing.
+     */
+    bool   task_active = false;
+    double task_started = 0.0;
 
     double speed_deg_s = 30.0;      // full-deflection rate
 
@@ -222,10 +259,52 @@ struct Status {
     // the gimbal still.
     bool   calib_running = false;
     double calib_started = 0.0;
+    /*
+     * Motors are on and a calibration is armed, waiting for the gimbal to stop
+     * settling. Surfaced because "it is about to hold the camera still for
+     * four seconds" is something the operator should see coming rather than
+     * discover when the controls go quiet.
+     */
+    bool   calib_pending = false;
+    /* The armed calibration gave up: the gimbal never went still. */
+    bool   calib_skipped = false;
 };
 
 Status g_status;
 std::atomic<bool> g_running{true};
+
+/*
+ * PITCH SIGN.
+ *
+ * The board's pitch is positive DOWNWARD. The 2.6x manual, RC Settings:
+ * "if you want to configure a camera to go only from a leveled position to
+ * down position, set min=0, max=90". The vendor's own CMD_CONTROL example
+ * agrees — "Rotate PITCH 90 degrees up" encodes angle 0xF000, i.e. -90
+ * degrees (see test/test_sbgc_api.c).
+ *
+ * An operator pressing "up" means up, so the UI works in the opposite
+ * convention: +1 is up. The two meet here and nowhere else. Every UI-facing
+ * pitch number — commands, telemetry, travel limits — passes through this.
+ */
+double ui_pitch_from_board(double board_deg) { return -board_deg; }
+double board_pitch_from_ui(double ui_deg)    { return -ui_deg; }
+
+/*
+ * A board RC angle limit expressed the way the UI reads it.
+ *
+ * Pitch is the only axis that moves, and it does not merely change sign: the
+ * negation swaps which end is the minimum, so the two bounds trade places as
+ * well. Publishing the board's pair unconverted under the same "pitch" key the
+ * page compares a positive-up angle against inverted the out-of-range
+ * indicator exactly — a camera parked mid-travel read as out of range, and one
+ * genuinely past the limit read as inside it.
+ */
+AxisLimits ui_limits_from_board(int axis, double lo, double hi)
+{
+    if (axis == SBGC_PITCH)
+        return { ui_pitch_from_board(hi), ui_pitch_from_board(lo) };
+    return { lo, hi };
+}
 
 // ------------------------------------------------------------ serial loop --
 
@@ -250,6 +329,7 @@ void on_frame(uint8_t cmd, const uint8_t *payload, size_t len, void *user)
             if (sbgc_parse_realtime_3(payload, len, &rt) == 0) {
                 st->rt = rt;
                 st->have_rt = true;
+                st->rt_stamp = monotonic_s();
                 rs->got_realtime = true;
             }
             break;
@@ -261,22 +341,25 @@ void on_frame(uint8_t cmd, const uint8_t *payload, size_t len, void *user)
                 st->have_params = true;
                 rs->got_params = true;
 
-                // Adopt the board's own travel limits. An axis reporting
-                // 0..0 has no RC angle limit configured at all, so the
-                // previous (file or built-in) value is kept for it rather
-                // than collapsing the display to a zero-width range.
-                auto adopt = [](AxisLimits &dst, int16_t lo, int16_t hi) {
+                // Adopt the board's own travel limits, converted into the
+                // UI's convention on the way in. An axis reporting 0..0 has
+                // no RC angle limit configured at all, so the previous (file
+                // or built-in) value is kept for it rather than collapsing
+                // the display to a zero-width range.
+                auto adopt = [](AxisLimits &dst, int axis, int16_t lo, int16_t hi) {
                     if (lo == 0 && hi == 0) return false;
-                    dst.min_deg = lo;
-                    dst.max_deg = hi;
+                    dst = ui_limits_from_board(axis, lo, hi);
                     return true;
                 };
                 bool any = false;
-                any |= adopt(st->roll,  p.rc[SBGC_ROLL].rc_min_angle,
+                any |= adopt(st->roll,  SBGC_ROLL,
+                                        p.rc[SBGC_ROLL].rc_min_angle,
                                         p.rc[SBGC_ROLL].rc_max_angle);
-                any |= adopt(st->pitch, p.rc[SBGC_PITCH].rc_min_angle,
+                any |= adopt(st->pitch, SBGC_PITCH,
+                                        p.rc[SBGC_PITCH].rc_min_angle,
                                         p.rc[SBGC_PITCH].rc_max_angle);
-                any |= adopt(st->yaw,   p.rc[SBGC_YAW].rc_min_angle,
+                any |= adopt(st->yaw,   SBGC_YAW,
+                                        p.rc[SBGC_YAW].rc_min_angle,
                                         p.rc[SBGC_YAW].rc_max_angle);
                 if (any) st->limits_source = Status::LIMITS_BOARD;
             }
@@ -308,20 +391,47 @@ const double CONTROL_TIMEOUT_S = 0.5;
 const double CALIB_SECONDS = 4.5;
 
 /*
- * PITCH SIGN.
- *
- * The board's pitch is positive DOWNWARD. The 2.6x manual, RC Settings:
- * "if you want to configure a camera to go only from a leveled position to
- * down position, set min=0, max=90". The vendor's own CMD_CONTROL example
- * agrees — "Rotate PITCH 90 degrees up" encodes angle 0xF000, i.e. -90
- * degrees (see test/test_sbgc_api.c).
- *
- * An operator pressing "up" means up, so the UI works in the opposite
- * convention: +1 is up. The two meet here and nowhere else. Every UI-facing
- * pitch number — commands, telemetry, travel limits — passes through this.
+ * How old the board's reported angle may be and still be treated as where the
+ * camera actually is. Realtime data is requested every 40 ms, so anything
+ * approaching this means the board has stopped answering. Matched to
+ * CONTROL_TIMEOUT_S deliberately: if we have not heard the angle for as long
+ * as it takes an operator's own command to expire, we do not know where the
+ * camera is pointing and must not pretend otherwise.
  */
-double ui_pitch_from_board(double board_deg) { return -board_deg; }
-double board_pitch_from_ui(double ui_deg)    { return -ui_deg; }
+const double ANGLE_FRESH_S = 0.5;
+
+/*
+ * How long a home or level AUTO_TASK is assumed to still be running. The board
+ * sends no completion frame this tool has verified, so — as with calibration —
+ * the end is inferred from a duration rather than invented from a reply. It is
+ * generous: over-estimating means a disarm sends one redundant stop, while
+ * under-estimating means a disarm mid-slew sends none at all.
+ */
+const double TASK_SECONDS = 6.0;
+
+/*
+ * Deciding when a gimbal that has just been powered has finished settling.
+ *
+ * CALIB_STILL_DEG is the most any axis may move between two consecutive
+ * telemetry samples (40 ms apart) and still count as stationary. It is a
+ * couple of times the reading noise, not zero: an actively stabilised gimbal
+ * is never perfectly numerically still, and demanding that it be would mean
+ * the calibration never runs.
+ *
+ * CALIB_STILL_S is how long that has to hold. A settling gimbal crosses
+ * through zero movement on its way past, so a single quiet sample proves
+ * nothing; it has to stay quiet.
+ */
+const double CALIB_STILL_DEG = 0.20;
+const double CALIB_STILL_S   = 1.00;
+
+/*
+ * How long to wait for a gimbal that has just been powered to go still before
+ * giving up on calibrating it. Generous, because a slow settle is normal and
+ * the cost of waiting is nothing; finite, because a robot that drives off
+ * immediately after power-on would otherwise leave the request armed forever.
+ */
+const double CALIB_SETTLE_TIMEOUT_S = 20.0;
 
 /*
  * Roll is not an operator-controlled axis on this robot.
@@ -402,6 +512,27 @@ void note_tx(sbgc_t &sb, const char *what)
     g_status.last_cmd_at  = monotonic_s();
 }
 
+/*
+ * Record a frame that did NOT reach the port. That readout exists to turn
+ * "the button did nothing" into a question with an answer — reporting a
+ * failed write as a successful one is the single thing it must never do,
+ * because it points the operator away from the actual fault.
+ */
+void note_tx_failed(sbgc_t &sb, const char *what)
+{
+    std::string err = sbgc_last_error(&sb);
+    std::lock_guard<std::mutex> lk(g_status.mu);
+    g_status.last_cmd     = std::string(what) + " — NOT SENT";
+    g_status.last_cmd_hex = err;
+    g_status.last_cmd_at  = monotonic_s();
+}
+
+/*
+ * `fn` must return the underlying sbgc_* status: 0 sent, non-zero failed.
+ * A write that never made it out is reported as the failure it is. Treating
+ * it as success would set motion_active for a frame the board never saw, and
+ * would let the home/level branch suppress the stop that should follow.
+ */
 template <typename Fn>
 bool send_motion(sbgc_t &sb, const char *what, Fn &&fn)
 {
@@ -410,7 +541,10 @@ bool send_motion(sbgc_t &sb, const char *what, Fn &&fn)
                      "gimbal_gui: blocked a motion command; control is not armed\n");
         return false;
     }
-    fn();
+    if (fn() != 0) {
+        note_tx_failed(sb, what);
+        return false;
+    }
     note_tx(sb, what);
     return true;
 }
@@ -423,7 +557,16 @@ void serial_thread(Options opt)
 
     RxState rs{ &g_status, false, false, false };
 
-    bool   calib_done   = false;
+    // Calibrate-on-motors-on tracking. All local to this thread: it is the
+    // only writer, and none of it is meaningful to anyone else.
+    bool   motors_were_on   = false;
+    bool   calib_armed      = false;   // motors came on, waiting for stillness
+    double calib_armed_at   = 0.0;
+    double still_since      = 0.0;     // when the angles last stopped changing
+    double last_still_stamp = 0.0;     // rt_stamp of the last sample judged
+    bool   have_prev_angle  = false;
+    double prev_angle[SBGC_NUM_AXES] = { 0, 0, 0 };
+
     double last_reopen  = 0.0;
     double last_rt      = 0.0;
     double last_info    = 0.0;
@@ -575,34 +718,134 @@ void serial_thread(Options opt)
         }
 
         /*
-         * One-shot gyro calibration at startup, when asked for on the command
-         * line. The flag is itself the operator's authorisation for this one
-         * action, so it does not wait for the UI arm toggle — but it still
-         * requires --allow-control, because read-only has to mean read-only.
+         * ---------------------------------------------- calibrate on power --
          *
-         * It waits for the board to actually answer first: firing a
-         * calibration into a board that has not finished booting silently
-         * achieves nothing.
+         * Gyro calibration every time the motors come on.
+         *
+         * Motors-on is the right trigger: the bias the board learns is only
+         * valid for as long as the sensor stays at the temperature and the
+         * mounting stress it was measured under, and switching the motors on
+         * changes both. A gimbal that has sat limp and cold, then been
+         * powered, is exactly the one whose stored bias is furthest from the
+         * truth. Doing it here also means the operator never has to remember.
+         *
+         * It is NOT fired the instant the flag flips, and that is the whole
+         * subtlety. Motors engaging is when the gimbal grabs its position and
+         * swings while the loop settles, so the moment of switch-on is the
+         * single worst instant in the whole session to measure a zero-rate
+         * bias at. Calibrating a moving gimbal is what teaches the wrong bias
+         * and leaves the camera drifting afterwards — the exact failure this
+         * is meant to prevent. So motors-on only ARMS the calibration; it
+         * fires once the board's own reported angles say the gimbal has
+         * actually stopped moving.
+         *
+         * If it never settles — the robot is driving, the gimbal is
+         * oscillating, someone is holding it — the request is abandoned with
+         * a warning rather than run on a moving gimbal or waited on forever.
+         *
+         * Requires --allow-control, because read-only has to mean read-only.
+         * It deliberately does NOT wait for the UI arm toggle: arming guards
+         * against unwanted OPERATOR-COMMANDED motion, and this commands none.
          */
-        if (opt.calib_gyro_on_start && opt.allow_control && !calib_done) {
-            bool ready;
+        if (opt.calib_gyro_on_motors && opt.allow_control) {
+            bool motors_now = false, responding = false, busy = false;
+            bool moving = false;
+            double angle[SBGC_NUM_AXES] = { 0, 0, 0 };
+            double stamp = 0;
             {
                 std::lock_guard<std::mutex> lk(g_status.mu);
-                ready = g_status.board_responding && g_status.have_rt;
+                responding = g_status.board_responding && g_status.have_rt;
+                motors_now = responding && g_status.rt.motors_on != 0;
+                busy       = g_status.calib_running;
+                moving     = g_status.motion_active || g_status.task_active;
+                stamp      = g_status.rt_stamp;
+                for (int a = 0; a < SBGC_NUM_AXES; a++)
+                    angle[a] = g_status.rt.imu_deg[a];
             }
-            if (ready) {
-                calib_done = true;
-                {
+
+            // Motors off, or the board went quiet: nothing is armed, and the
+            // next power-on starts the sequence again from scratch.
+            if (!motors_now) {
+                if (calib_armed) {
+                    calib_armed = false;
                     std::lock_guard<std::mutex> lk(g_status.mu);
-                    g_status.calib_running = true;
-                    g_status.calib_started = monotonic_s();
+                    g_status.calib_pending = false;
                 }
-                if (sbgc_calib_gyro(&sb) == 0)
-                    std::printf("  gyro calibration requested — keep the gimbal still\n");
-                else
-                    std::fprintf(stderr, "  gyro calibration failed to send: %s\n",
-                                 sbgc_last_error(&sb));
-                std::fflush(stdout);
+                motors_were_on = false;
+            } else {
+                if (!motors_were_on) {
+                    motors_were_on = true;
+                    calib_armed    = true;
+                    calib_armed_at = now;
+                    still_since    = 0.0;
+                    have_prev_angle = false;
+                    std::lock_guard<std::mutex> lk(g_status.mu);
+                    g_status.calib_pending = true;
+                    g_status.calib_skipped = false;   // a fresh attempt
+                }
+
+                /*
+                 * Stillness is judged only on FRESH samples. The loop runs
+                 * faster than telemetry arrives, so comparing every pass would
+                 * compare a reading with itself and call a moving gimbal
+                 * still within two iterations.
+                 */
+                if (calib_armed && !busy && stamp != last_still_stamp) {
+                    last_still_stamp = stamp;
+                    double moved = 0.0;
+                    if (have_prev_angle) {
+                        for (int a = 0; a < SBGC_NUM_AXES; a++)
+                            moved = std::max(moved, std::fabs(angle[a] - prev_angle[a]));
+                    }
+                    for (int a = 0; a < SBGC_NUM_AXES; a++) prev_angle[a] = angle[a];
+
+                    if (!have_prev_angle) {
+                        have_prev_angle = true;         // no delta to judge yet
+                    } else if (moved > CALIB_STILL_DEG) {
+                        still_since = 0.0;              // still settling
+                    } else if (still_since == 0.0) {
+                        still_since = now;
+                    }
+                }
+
+                bool settled = calib_armed && !busy && !moving &&
+                               still_since > 0.0 &&
+                               (now - still_since) >= CALIB_STILL_S;
+
+                if (settled) {
+                    calib_armed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_status.mu);
+                        g_status.calib_pending = false;
+                        g_status.calib_running = true;
+                        g_status.calib_started = monotonic_s();
+                    }
+                    if (sbgc_calib_gyro(&sb) == 0) {
+                        note_tx(sb, "calibrate gyro (motors on)");
+                        std::printf("  motors on and gimbal settled — calibrating "
+                                    "gyro; keep it still\n");
+                    } else {
+                        note_tx_failed(sb, "calibrate gyro (motors on)");
+                        std::lock_guard<std::mutex> lk(g_status.mu);
+                        g_status.calib_running = false;
+                        std::fprintf(stderr,
+                                     "  gyro calibration failed to send: %s\n",
+                                     sbgc_last_error(&sb));
+                    }
+                    std::fflush(stdout);
+                } else if (calib_armed &&
+                           (now - calib_armed_at) > CALIB_SETTLE_TIMEOUT_S) {
+                    /*
+                     * Never went still. Abandoning is the only honest option:
+                     * calibrating anyway would write the wrong bias, and
+                     * holding the request open forever would leave the
+                     * operator wondering why it never ran.
+                     */
+                    calib_armed = false;
+                    std::lock_guard<std::mutex> lk(g_status.mu);
+                    g_status.calib_pending = false;
+                    g_status.calib_skipped = true;
+                }
             }
         }
 
@@ -617,6 +860,12 @@ void serial_thread(Options opt)
             if (g_status.calib_running &&
                 monotonic_s() - g_status.calib_started > CALIB_SECONDS)
                 g_status.calib_running = false;
+            // A home or level is assumed finished after TASK_SECONDS, for the
+            // same reason and with the same caveat as calibration: the board
+            // announces neither.
+            if (g_status.task_active &&
+                monotonic_s() - g_status.task_started > TASK_SECONDS)
+                g_status.task_active = false;
         }
 
         // --- motion ---
@@ -632,7 +881,7 @@ void serial_thread(Options opt)
             double lim_pitch_min = 0, lim_pitch_max = 0;
             double yaw_now = 0, pitch_now = 0;
             int  want_motors = -1;
-            bool was_active;
+            bool was_active, was_task, calibrating;
             {
                 std::lock_guard<std::mutex> lk(g_status.mu);
                 armed = g_status.control_allowed && g_status.control_armed;
@@ -642,6 +891,8 @@ void serial_thread(Options opt)
                 stamp = g_status.intent_stamp;
                 speed = g_status.speed_deg_s;
                 was_active = g_status.motion_active;
+                was_task    = g_status.task_active;
+                calibrating = g_status.calib_running;
 
                 want_home   = g_status.pending_home;   g_status.pending_home   = false;
                 want_level  = g_status.pending_level;  g_status.pending_level  = false;
@@ -655,11 +906,22 @@ void serial_thread(Options opt)
                 lim_yaw_max   = g_status.user_yaw.max_deg;
                 lim_pitch_min = g_status.user_pitch.min_deg;
                 lim_pitch_max = g_status.user_pitch.max_deg;
-                have_angle    = g_status.have_rt;
+                /*
+                 * The angle must be CURRENT, not merely present. have_rt only
+                 * ever latches true, so a board whose TX path has died —
+                 * broken RX wire, IMU fault — while it still accepts commands
+                 * leaves rt frozen at a plausible-looking value. Checking a
+                 * limit against that reading lets the camera drive straight
+                 * through it, because the number never moves.
+                 */
+                have_angle    = g_status.have_rt &&
+                                (monotonic_s() - g_status.rt_stamp) < ANGLE_FRESH_S;
                 yaw_now       = g_status.rt.imu_deg[SBGC_YAW];
                 pitch_now     = ui_pitch_from_board(g_status.rt.imu_deg[SBGC_PITCH]);
-                if (!g_status.motion_active)
+                if (!g_status.motion_active) {
                     g_status.limit_blocked_yaw = g_status.limit_blocked_pitch = false;
+                    g_status.limit_stale = false;
+                }
 
                 custom_home = g_status.have_custom_home;
                 for (int a = 0; a < SBGC_NUM_AXES; a++)
@@ -677,26 +939,47 @@ void serial_thread(Options opt)
                              (pan != 0.0 || tilt != 0.0 || roll != 0.0);
 
             if (!armed) {
-                // Not armed: honour a queued stop, and if we were moving stop
-                // once, then stay silent. Consuming pending_stop above without
-                // acting on it here would drop a stop that arrived in the
-                // instant the operator disarmed.
-                if (was_active || want_stop) {
+                // Not armed: honour a queued stop, and if anything was in
+                // flight stop once, then stay silent. Consuming pending_stop
+                // above without acting on it here would drop a stop that
+                // arrived in the instant the operator disarmed.
+                //
+                // was_task is part of the test because a home or level is
+                // owned by the board until it finishes. Without it, disarming
+                // mid-slew saw no rate in flight, sent nothing, and the camera
+                // carried on to home while the UI read "Safe" — so disarm
+                // could not be used to abort a home heading somewhere unsafe.
+                if (was_active || was_task || want_stop) {
                     /*
                      * A plain hold, not send_rate_roll_locked. Re-levelling
                      * roll would be initiating a movement, and this branch runs
                      * precisely when control is not armed. Holding every axis
                      * where it stands is the conservative choice here.
                      */
-                    sbgc_stop(&sb);
-                    note_tx(sb, "stop");
-                    std::lock_guard<std::mutex> lk(g_status.mu);
-                    g_status.motion_active = false;
+                    if (sbgc_stop(&sb) == 0) {
+                        note_tx(sb, "stop");
+                        std::lock_guard<std::mutex> lk(g_status.mu);
+                        g_status.motion_active = false;
+                        // A zero-rate CMD_CONTROL replaces the AUTO_TASK, so
+                        // this stop ends the home/level too.
+                        g_status.task_active = false;
+                    } else {
+                        /*
+                         * The frame never left the port. motion_active stays
+                         * set: it is what makes the reconnect path stop the
+                         * board before anything else, and it is what raises
+                         * the "moving with no link" warning in the meantime.
+                         * Clearing it here would report a stop that did not
+                         * happen and discard the only record that one is owed.
+                         */
+                        note_tx_failed(sb, "stop");
+                    }
                 }
             } else {
                 if (want_motors >= 0)
                     send_motion(sb, want_motors ? "motors on" : "motors off", [&] {
-                        want_motors ? sbgc_motors_on(&sb) : sbgc_motors_off(&sb);
+                        return want_motors ? sbgc_motors_on(&sb)
+                                           : sbgc_motors_off(&sb);
                     });
                 /*
                  * home and level are AUTO_TASKs: the board owns the move
@@ -710,7 +993,7 @@ void serial_thread(Options opt)
                  * an operator pressing stop must always be obeyed.
                  */
                 bool task_issued = false;
-                if (want_home) {
+                if (want_home && !calibrating) {
                     bool ok;
                     if (custom_home) {
                         /*
@@ -737,40 +1020,107 @@ void serial_thread(Options opt)
                             sp[a]   = sbgc_degs_to_units(speed);
                         }
                         ok = send_motion(sb, "home (taught)", [&] {
-                            sbgc_control_raw(&sb, mode, sp, home_units);
+                            return sbgc_control_raw(&sb, mode, sp, home_units);
                         });
                     } else {
-                        ok = send_motion(sb, "home", [&] { sbgc_home(&sb); });
+                        ok = send_motion(sb, "home", [&] { return sbgc_home(&sb); });
                     }
                     if (ok) task_issued = true;
                 }
-                if (want_level && send_motion(sb, "level", [&] { sbgc_level(&sb); })) task_issued = true;
+                if (want_level && !calibrating &&
+                    send_motion(sb, "level", [&] { return sbgc_level(&sb); }))
+                    task_issued = true;
+
+                if (task_issued) {
+                    std::lock_guard<std::mutex> lk(g_status.mu);
+                    g_status.task_active  = true;
+                    g_status.task_started = monotonic_s();
+                }
 
                 /*
-                 * Calibration counts as a task too. Without this the stop or
-                 * rate command below goes out microseconds later, and the
-                 * browser's 20 Hz republisher keeps streaming rates through
-                 * the calibration — exactly the "gimbal is moving while it
-                 * calibrates" case that teaches the board a wrong bias.
+                 * Calibration counts as a task too, and a rate already in
+                 * flight has to be RECALLED before it starts rather than
+                 * merely forgotten. The board learns its zero-rate bias from a
+                 * gimbal it assumes is still; starting on one that is slewing
+                 * is precisely the case that teaches a wrong bias and leaves
+                 * the camera drifting for every session afterwards.
+                 *
+                 * If that stop cannot be sent, the calibration does not start.
+                 * Better to lose the request than to run it on a moving gimbal.
                  */
-                if (want_calib && send_motion(sb, "calibrate gyro",
-                                              [&] { sbgc_calib_gyro(&sb); })) {
-                    task_issued = true;
-                    std::lock_guard<std::mutex> lk(g_status.mu);
-                    g_status.calib_running = true;
-                    g_status.calib_started = monotonic_s();
+                if (want_calib) {
+                    bool still_moving = was_active;
+                    if (still_moving) {
+                        if (send_rate_roll_locked(&sb, 0.0, 0.0, speed) == 0) {
+                            note_tx(sb, "stop (before calibration)");
+                            still_moving = false;
+                            std::lock_guard<std::mutex> lk(g_status.mu);
+                            g_status.motion_active = false;
+                        } else {
+                            note_tx_failed(sb, "stop (before calibration)");
+                        }
+                    }
+                    if (!still_moving &&
+                        send_motion(sb, "calibrate gyro",
+                                    [&] { return sbgc_calib_gyro(&sb); })) {
+                        task_issued = true;
+                        calibrating = true;
+                        std::lock_guard<std::mutex> lk(g_status.mu);
+                        g_status.calib_running = true;
+                        g_status.calib_started = monotonic_s();
+                        // An explicit calibration answers whatever the
+                        // automatic one failed to do.
+                        g_status.calib_skipped = false;
+                    }
                 }
 
                 if (want_stop) {
-                    send_rate_roll_locked(&sb, 0.0, 0.0, speed);
-                    note_tx(sb, "stop");
-                    std::lock_guard<std::mutex> lk(g_status.mu);
-                    g_status.motion_active = false;
+                    if (send_rate_roll_locked(&sb, 0.0, 0.0, speed) == 0) {
+                        note_tx(sb, "stop");
+                        std::lock_guard<std::mutex> lk(g_status.mu);
+                        g_status.motion_active = false;
+                        g_status.task_active   = false;
+                    } else {
+                        // Still moving as far as anyone knows. Keep the flag
+                        // so the next pass retries and the reconnect path
+                        // knows a stop is outstanding.
+                        note_tx_failed(sb, "stop");
+                    }
                 } else if (task_issued) {
                     // The board is running the task. Drop our rate state so
                     // the watchdog does not fire a stop that cancels it.
                     std::lock_guard<std::mutex> lk(g_status.mu);
                     g_status.motion_active = false;
+                } else if (calibrating) {
+                    /*
+                     * Hold everything for the WHOLE calibration, not just the
+                     * pass that started it.
+                     *
+                     * Suppressing one pass was not enough: the browser
+                     * republishes at 20 Hz, so on the very next pass — tens of
+                     * milliseconds later — want_calib was already false, the
+                     * held control was still fresh, and a rate went out for
+                     * the remaining four seconds of a calibration that is
+                     * supposed to happen on a motionless gimbal.
+                     *
+                     * Nothing is transmitted here. Motion was recalled before
+                     * the calibration began, so there is nothing left to stop,
+                     * and any CMD_CONTROL now would cancel the calibration.
+                     */
+                } else if (want_move && lim_on && !have_angle) {
+                    /*
+                     * Limits are on and there is no current angle to check
+                     * them against. Refuse the move rather than let it through
+                     * unchecked: the operator asked for a limit to be
+                     * enforced, and enforcing one against a position nobody
+                     * knows is not something this can honestly do. Turning the
+                     * limits off in the UI remains available to recover a
+                     * camera by hand.
+                     */
+                    std::lock_guard<std::mutex> lk(g_status.mu);
+                    g_status.limit_stale = true;
+                    g_status.limit_blocked_yaw = g_status.limit_blocked_pitch = true;
+                    if (was_active) g_status.motion_active = false;
                 } else if (want_move) {
                     // Map the UI's normalised deflection onto the logical
                     // axes. Roll is scaled down: on a patrol camera it is
@@ -797,18 +1147,28 @@ void serial_thread(Options opt)
                     }
 
                     if (send_motion(sb, "rate", [&] {
-                            send_rate_roll_locked(&sb, pan_r, tilt_r, speed);
+                            return send_rate_roll_locked(&sb, pan_r, tilt_r, speed);
                         })) {
                         std::lock_guard<std::mutex> lk(g_status.mu);
                         g_status.motion_active = true;
+                        // This CMD_CONTROL replaced any AUTO_TASK the board
+                        // was running, so there is no longer one to abort.
+                        g_status.task_active = false;
                     }
                 } else if (was_active) {
                     // The operator released, or commands stopped arriving and
                     // the watchdog expired. Both mean stop.
-                    send_rate_roll_locked(&sb, 0.0, 0.0, speed);
-                    note_tx(sb, "stop (watchdog)");
-                    std::lock_guard<std::mutex> lk(g_status.mu);
-                    g_status.motion_active = false;
+                    if (send_rate_roll_locked(&sb, 0.0, 0.0, speed) == 0) {
+                        note_tx(sb, "stop (watchdog)");
+                        std::lock_guard<std::mutex> lk(g_status.mu);
+                        g_status.motion_active = false;
+                        g_status.task_active   = false;
+                    } else {
+                        // Leaving motion_active set means this branch runs
+                        // again next pass, so a stop keeps being retried for
+                        // as long as the board is believed to be moving.
+                        note_tx_failed(sb, "stop (watchdog)");
+                    }
                 }
             }
         }
@@ -1005,12 +1365,26 @@ std::vector<Warning> compute_warnings(const Status &st)
      * failsafe, so a rate that was in flight when the port died is still
      * running and cannot be recalled.
      */
-    if (st.motion_active && !st.board_responding) {
+    if ((st.motion_active || st.task_active) && !st.board_responding) {
         w.push_back({ "danger",
             "The link dropped while the gimbal was moving. This board has no "
             "serial-loss failsafe, so it may still be turning and cannot be "
             "commanded until the link is back. Cut motor power if it is "
             "heading for a hard stop." });
+    }
+
+    /*
+     * Enforcing a travel limit needs a current angle. When there is not one,
+     * motion is held rather than allowed through unchecked, and the operator
+     * has to be told why the controls have gone dead — otherwise this looks
+     * identical to a broken page.
+     */
+    if (st.limit_stale) {
+        w.push_back({ "danger",
+            "Travel limits are on, but the board has stopped reporting its "
+            "angle, so there is no way to tell where the camera is pointing. "
+            "Motion is held until a fresh reading arrives. Turn the limits off "
+            "if you need to move the camera by hand first." });
     }
 
     if (!st.link_open) {
@@ -1093,8 +1467,14 @@ std::vector<Warning> compute_warnings(const Status &st)
             { "yaw",   &st.file_yaw,   SBGC_YAW   },
         };
         for (auto &a : axes) {
-            double bmin = st.params.rc[a.idx].rc_min_angle;
-            double bmax = st.params.rc[a.idx].rc_max_angle;
+            // file_* are stored the way the UI reads them, so the board's
+            // pair is converted before the comparison. Comparing the two
+            // conventions directly would report every pitch limit as a
+            // mismatch, on a board that agrees with the file exactly.
+            double raw_min = st.params.rc[a.idx].rc_min_angle;
+            double raw_max = st.params.rc[a.idx].rc_max_angle;
+            AxisLimits board = ui_limits_from_board(a.idx, raw_min, raw_max);
+            double bmin = board.min_deg, bmax = board.max_deg;
             if (a.file->min_deg == bmin && a.file->max_deg == bmax) continue;
 
             char b[280];
@@ -1119,16 +1499,35 @@ std::vector<Warning> compute_warnings(const Status &st)
     }
 
     /*
-     * The board calibrates its own gyro at power-on unless "Skip gyro
-     * calibration at startup" is set (2.6x manual, "IMU Calibration"). When it
-     * already does that, a second calibration from this tool buys nothing and
-     * carries real risk, because it can fire while the robot is moving.
+     * The board calibrates its own gyro when the CONTROLLER powers on, unless
+     * "Skip gyro calibration at startup" is set (2.6x manual, "IMU
+     * Calibration"). That is a different event from the motors being switched
+     * on, which is what this tool triggers on and which can happen many times
+     * without the board ever rebooting — so the two do not make each other
+     * redundant. Say which is which rather than implying one replaces the
+     * other.
      */
     if (st.have_params && st.params.skip_gyro_calib == 0) {
         w.push_back({ "info",
-            "The board already calibrates its gyro at every power-on, so a "
-            "calibration from here is usually redundant. Run --no-calib-gyro "
-            "unless you have a reason to repeat it." });
+            "The board also calibrates its gyro when the controller itself "
+            "powers on. This tool calibrates when the MOTORS are switched on, "
+            "which is a different and more frequent event. Run "
+            "--no-calib-gyro if you only want the board's own." });
+    }
+
+    // The controls are about to go quiet for several seconds. Saying so first
+    // is the difference between "it is calibrating" and "it has frozen".
+    if (st.calib_pending) {
+        w.push_back({ "info",
+            "Motors are on, so the gyro will be calibrated as soon as the "
+            "gimbal stops settling. Keep it still and it will start sooner." });
+    }
+
+    if (st.calib_skipped) {
+        w.push_back({ "warn",
+            "The gyro was not calibrated after the motors came on: the gimbal "
+            "never stopped moving long enough to measure a bias. It may drift. "
+            "Use the Calibrate button once it is stationary." });
     }
 
     /*
@@ -1386,9 +1785,13 @@ std::string build_status_json()
     o += "\"control\":{";
     kv_bool(o, "allowed", st.control_allowed);
     kv_bool(o, "armed", st.control_armed);
-    kv_bool(o, "moving", st.motion_active);
+    // A home or level slew is the camera moving just as much as a rate is,
+    // even though this program is not the thing driving it moment to moment.
+    kv_bool(o, "moving", st.motion_active || st.task_active);
     kv_num(o, "speed_deg_s", st.speed_deg_s, 0);
     kv_bool(o, "calib_running", st.calib_running);
+    kv_bool(o, "calib_pending", st.calib_pending);
+    kv_bool(o, "calib_skipped", st.calib_skipped);
     kv_num(o, "calib_elapsed", st.calib_running
                ? monotonic_s() - st.calib_started : 0.0, 2);
     kv_num(o, "calib_total", CALIB_SECONDS, 0);
@@ -1397,12 +1800,16 @@ std::string build_status_json()
     kv_num(o, "last_cmd_age", st.last_cmd_at > 0.0
                ? monotonic_s() - st.last_cmd_at : -1.0, 2);
     kv_bool(o, "limits_on", st.user_limits_on);
-    kv_num(o, "lim_yaw_min", st.user_yaw.min_deg, 0);
-    kv_num(o, "lim_yaw_max", st.user_yaw.max_deg, 0);
-    kv_num(o, "lim_pitch_min", st.user_pitch.min_deg, 0);
-    kv_num(o, "lim_pitch_max", st.user_pitch.max_deg, 0);
+    // One decimal, matching the form's step. Reporting these as whole degrees
+    // made a typed 90.5 come back as 90 — the page then showed a limit that
+    // was not the one being enforced.
+    kv_num(o, "lim_yaw_min", st.user_yaw.min_deg, 1);
+    kv_num(o, "lim_yaw_max", st.user_yaw.max_deg, 1);
+    kv_num(o, "lim_pitch_min", st.user_pitch.min_deg, 1);
+    kv_num(o, "lim_pitch_max", st.user_pitch.max_deg, 1);
     kv_bool(o, "blocked_yaw", st.limit_blocked_yaw);
     kv_bool(o, "blocked_pitch", st.limit_blocked_pitch);
+    kv_bool(o, "limit_stale", st.limit_stale);
     kv_bool(o, "custom_home", st.have_custom_home);
     kv_num(o, "home_pitch", st.home_pitch_deg, 1);
     kv_num(o, "home_yaw", st.home_yaw_deg, 1, false);
@@ -1430,18 +1837,74 @@ std::string build_status_json()
 // ----------------------------------------------------------- HTTP handler --
 
 /*
+ * Split an HTTP authority — "host", "host:port", "[::1]:port" — into its two
+ * parts. An IPv6 literal is bracketed precisely so its colons cannot be read
+ * as the port separator, so the brackets have to be handled before the split.
+ */
+void split_authority(const std::string &authority,
+                     std::string &host, std::string &port)
+{
+    host.clear();
+    port.clear();
+    if (authority.empty()) return;
+
+    if (authority[0] == '[') {
+        size_t end = authority.find(']');
+        if (end == std::string::npos) { host = authority; return; }
+        host = authority.substr(1, end - 1);
+        if (end + 1 < authority.size() && authority[end + 1] == ':')
+            port = authority.substr(end + 2);
+        return;
+    }
+
+    size_t colon = authority.find(':');
+    if (colon == std::string::npos) { host = authority; return; }
+    host = authority.substr(0, colon);
+    port = authority.substr(colon + 1);
+}
+
+/* The names that all mean "this machine". Compared whole, never as prefixes. */
+bool is_loopback_host(const std::string &host)
+{
+    return host == "127.0.0.1" || host == "localhost" ||
+           host == "::1" || host == "0:0:0:0:0:0:0:1";
+}
+
+/*
  * True when this request did not come from another site. A same-origin fetch
  * from our own page carries an Origin naming our host; a tool like curl sends
  * none at all. Anything else is another page trying to drive the gimbal.
+ *
+ * The authority is compared in full. Prefix-matching the host would accept
+ * anything merely *beginning* with a name we trust — localhost.attacker.example
+ * is one wildcard DNS record away, and it would pass while being a wholly
+ * different site. The port is part of the comparison for the same reason: a
+ * page served by some other daemon on this machine is not our page.
  */
 bool origin_is_ours(const httpd_request_t *req)
 {
     if (!req->origin[0]) return true;          /* not a browser page */
-    const char *host = std::strstr(req->origin, "//");
-    host = host ? host + 2 : req->origin;
-    return std::strncmp(host, "127.0.0.1", 9) == 0 ||
-           std::strncmp(host, "localhost", 9) == 0 ||
-           std::strncmp(host, req->host, sizeof(req->host)) == 0;
+
+    /* Origin is "scheme://host[:port]" and nothing more, but refuse to let a
+     * stray path or query become part of the host if one ever shows up. */
+    const char *after_scheme = std::strstr(req->origin, "//");
+    std::string authority(after_scheme ? after_scheme + 2 : req->origin);
+    size_t cut = authority.find_first_of("/?#");
+    if (cut != std::string::npos) authority.erase(cut);
+
+    /* Whatever the operator typed to reach us is what Host carries, so an
+     * exact match is same-origin by definition. */
+    if (authority == req->host) return true;
+
+    std::string ohost, oport, hhost, hport;
+    split_authority(authority, ohost, oport);
+    split_authority(std::string(req->host), hhost, hport);
+
+    if (oport != hport) return false;
+
+    /* Reaching the same port by a different spelling of "this machine" —
+     * localhost versus 127.0.0.1 — is still our own page. */
+    return is_loopback_host(ohost) && is_loopback_host(hhost);
 }
 
 void handle_request(const httpd_request_t *req, httpd_response_t *resp, void *)
@@ -1813,13 +2276,15 @@ void usage()
 "  --pad DEV         gamepad event device; omit to auto-detect\n"
 "  --no-pad          do not look for a gamepad\n"
 "  --allow-control   permit the UI to arm motion commands (off by default)\n"
-"  --no-calib-gyro   skip the startup gyro calibration (it is ON by default)\n"
-"  --calib-gyro-on-start\n"
-"                    calibrate the gyro once, after the board first answers.\n"
+"  --no-calib-gyro   never calibrate the gyro automatically (it is ON by\n"
+"                    default). The Calibrate button still works.\n"
+"  --calib-gyro-on-motors\n"
+"                    calibrate the gyro every time the motors come on.\n"
 "                    ON BY DEFAULT; this flag only re-enables it after\n"
-"                    --no-calib-gyro.\n"
-"                    The gimbal must be STILL while it runs, or the board\n"
-"                    learns a wrong bias and drifts. Needs --allow-control.\n"
+"                    --no-calib-gyro. (--calib-gyro-on-start is an alias.)\n"
+"                    It waits for the gimbal to stop settling first: the\n"
+"                    gimbal must be STILL while it runs, or the board learns\n"
+"                    a wrong bias and drifts. Needs --allow-control.\n"
 "  --help\n");
 }
 
@@ -1867,8 +2332,11 @@ int main(int argc, char **argv)
         else if (a == "--pad" && i + 1 < argc) opt.pad_path = argv[++i];
         else if (a == "--no-pad") opt.no_pad = true;
         else if (a == "--allow-control") opt.allow_control = true;
-        else if (a == "--calib-gyro-on-start") opt.calib_gyro_on_start = true;
-        else if (a == "--no-calib-gyro") opt.calib_gyro_on_start = false;
+        // The old spelling stays accepted: it named the same intent, and
+        // silently rejecting it would break existing service units.
+        else if (a == "--calib-gyro-on-motors" ||
+                 a == "--calib-gyro-on-start") opt.calib_gyro_on_motors = true;
+        else if (a == "--no-calib-gyro") opt.calib_gyro_on_motors = false;
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); return 2; }
     }
@@ -1896,9 +2364,12 @@ int main(int argc, char **argv)
         g_status.limits_source = Status::LIMITS_BUILTIN;
 
         if (gc.have_limits) {
-            g_status.roll  = { gc.roll_min,  gc.roll_max  };
-            g_status.pitch = { gc.pitch_min, gc.pitch_max };
-            g_status.yaw   = { gc.yaw_min,   gc.yaw_max   };
+            // rcMinAngle/rcMaxAngle out of the .profile are the same fields
+            // the board reports, so they arrive in the board's convention and
+            // need the same conversion.
+            g_status.roll  = ui_limits_from_board(SBGC_ROLL,  gc.roll_min,  gc.roll_max);
+            g_status.pitch = ui_limits_from_board(SBGC_PITCH, gc.pitch_min, gc.pitch_max);
+            g_status.yaw   = ui_limits_from_board(SBGC_YAW,   gc.yaw_min,   gc.yaw_max);
             g_status.limits_source = Status::LIMITS_FILE;
 
             g_status.have_file_limits = true;
