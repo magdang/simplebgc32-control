@@ -148,11 +148,15 @@ def run_wizard(answers, commands, timeout=15):
     Answer order per axis is: axis choice, invert y/n, soft limit min, soft
     limit max — for PAN, TILT then ROLL — followed by default speed, step and
     the frame-reference question.
+
+    Returns (output, returncode). The return code matters here: the defect
+    this drives aborted the process, and an abort is far better evidence than
+    inspecting what it managed to print first.
     """
     p = subprocess.run([CTL_BIN, "--simulate"],
                        input="\n".join(answers + commands) + "\nquit\n",
                        capture_output=True, text=True, timeout=timeout)
-    return p.stdout + p.stderr
+    return p.stdout + p.stderr, p.returncode
 
 
 AXES_OK = ["1", "n", "-170", "170",
@@ -173,7 +177,9 @@ def test_wizard_validates_motion_defaults():
     """
     r.section("the setup wizard validates its motion defaults")
 
-    out = run_wizard(AXES_OK + ["99999", "30", "5", "y"], ["left"])
+    out, rc = run_wizard(AXES_OK + ["99999", "30", "5", "y"], ["left"])
+    r.check("the process exits cleanly rather than aborting", rc == 0,
+            f"rc={rc}")
     r.check("a speed above the ceiling is refused",
             "at most 500 deg/s" in out, out[-400:])
     r.check("the wizard re-asks rather than storing it",
@@ -190,12 +196,12 @@ def test_wizard_validates_motion_defaults():
     r.check("no crash or assertion escaped to the output",
             "Assertion" not in out and "Segmentation" not in out, out[-400:])
 
-    out = run_wizard(AXES_OK + ["30", "9999", "5", "y"], [])
+    out, _ = run_wizard(AXES_OK + ["30", "9999", "5", "y"], [])
     r.check("a step above the ceiling is refused",
             "at most 90 deg" in out, out[-400:])
 
-    out = run_wizard(["1", "n", "-9999", "170",
-                      "-170", "170"] + AXES_OK[4:] + ["30", "5", "y"], [])
+    out, _ = run_wizard(["1", "n", "-9999", "170",
+                         "-170", "170"] + AXES_OK[4:] + ["30", "5", "y"], [])
     r.check("a soft limit beyond a full turn is refused",
             "between -360 and 360" in out, out[-400:])
 

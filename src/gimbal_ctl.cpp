@@ -1407,7 +1407,7 @@ bool handle(const std::vector<std::string> &tok, sbgc_t &sb,
             std::cout << "  (use 'stop' to halt, not a speed of 0)\n";
             return true;
         }
-        if (v > MAX_RATE_DEG_S) {
+        if (!speed_ok(v)) {
             err_at(tok, 1, "speed " + tok[1] + " deg/s is implausibly high");
             std::cout << "  refusing; typical values are 20-120 deg/s\n";
             return true;
@@ -1424,7 +1424,7 @@ bool handle(const std::vector<std::string> &tok, sbgc_t &sb,
             err_at(tok, 1, "step must be greater than 0");
             return true;
         }
-        if (v > 90.0) {
+        if (!step_ok(v)) {
             err_at(tok, 1, "step " + tok[1] + " deg is too large");
             std::cout << "  refusing; a keypress should not swing more than 90 deg\n";
             return true;
