@@ -1265,7 +1265,10 @@ function render(s) {
   paintStick();
 
   // annunciators
-  if (!s.link.port_open)             lamp("lampLink", "alarm", "port closed");
+  // Simulation is its own state, not a fault. Reporting "no reply" would be
+  // true but useless — there is nothing on the other end to reply.
+  if (s.link.simulated)              lamp("lampLink", "warn", "simulated");
+  else if (!s.link.port_open)        lamp("lampLink", "alarm", "port closed");
   else if (!s.link.board_responding) lamp("lampLink", "alarm", "no reply");
   else                               lamp("lampLink", "live", "connected");
 
@@ -1328,8 +1331,10 @@ function render(s) {
   }
   $("portNote").textContent = s.link.note || "";
 
-  $("dPort").textContent = s.link.port_open ? "open" : (s.link.error || "closed");
-  $("dPort").className = s.link.port_open ? "" : "bad";
+  $("dPort").textContent = s.link.simulated ? "simulated — nothing is sent"
+                         : s.link.port_open ? "open"
+                         : (s.link.error || "closed");
+  $("dPort").className = s.link.simulated ? "warn" : s.link.port_open ? "" : "bad";
   $("dBaud").textContent = s.link.baud;
   $("dFrames").textContent = s.link.frames_rx;
   $("dDrops").textContent = s.link.timeouts;

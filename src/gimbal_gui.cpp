@@ -104,6 +104,13 @@ struct Options {
     bool        allow_control = false; // arms the control unlock
     bool        no_pad = false;
     /*
+     * No serial device at all: frames are encoded and recorded but never
+     * written. gimbal_ctl has had this since the start and the README leans on
+     * it as the first thing to run; the daemon had no hardware-free mode, so
+     * there was no way to bring the console up and see what it would send.
+     */
+    bool        simulate = false;
+    /*
      * Calibrate the gyro every time the motors come on. On by default: a
      * gimbal that has not zeroed its gyro drifts, powering the motors is what
      * invalidates the stored bias, and the operator asked for one less thing
@@ -124,6 +131,7 @@ struct Status {
     bool        link_open = false;      // serial port opened
     bool        board_responding = false;
     std::string link_error;
+    bool        simulated = false;   // --simulate: nothing is on the wire
     double      last_frame_age_s = 999.0;
     int         frames_rx = 0;
     int         timeouts = 0;
@@ -747,7 +755,9 @@ void serial_thread(Options opt)
              * telling the operator the link recovered.
              */
             struct stat pst;
-            if (::stat(opt.port.c_str(), &pst) != 0) {
+            if (opt.simulate) {
+                /* Nothing to find and nothing to probe. */
+            } else if (::stat(opt.port.c_str(), &pst) != 0) {
                 sbgc_port_t ports[SBGC_PORT_LIST_MAX];
                 int np = sbgc_gui_config_list_ports(ports, SBGC_PORT_LIST_MAX);
 
@@ -788,7 +798,15 @@ void serial_thread(Options opt)
             }
 
             std::memset(&sb, 0, sizeof(sb));
-            if (sbgc_open(&sb, opt.port.c_str(), opt.baud) == 0) {
+            if (opt.simulate) {
+                sbgc_open_simulated(&sb);
+                sbgc_set_quiet(&sb, 1);
+                open_ok = true;
+                last_rx_time = now;
+                std::lock_guard<std::mutex> lk(g_status.mu);
+                g_status.link_open = true;
+                g_status.link_error.clear();
+            } else if (sbgc_open(&sb, opt.port.c_str(), opt.baud) == 0) {
                 open_ok = true;
                 sbgc_set_quiet(&sb, 1);
                 last_rx_time = now;
@@ -1542,6 +1560,21 @@ std::vector<Warning> compute_warnings(const Status &st)
             "if you need to move the camera by hand first." });
     }
 
+    /*
+     * Said first, and unconditionally, so it is the first thing read. Every
+     * reading below is absent rather than wrong in this mode, and an operator
+     * who mistakes a simulated console for a live one has no way to tell that
+     * the gimbal is not responding because there is no gimbal.
+     */
+    if (st.simulated) {
+        w.push_back({ "warn",
+            "SIMULATION — no serial device is open. Commands are built and "
+            "shown exactly as they would go on the wire, but nothing is "
+            "transmitted and no telemetry is real. Restart without --simulate "
+            "to drive hardware." });
+        return w;   /* nothing below is knowable without a board */
+    }
+
     if (!st.link_open) {
         w.push_back({ "danger",
             "Serial port " + st.port + " could not be opened" +
@@ -1814,6 +1847,7 @@ std::string build_status_json()
     // --- link ---
     o += "\"link\":{";
     kv_bool(o, "port_open", st.link_open);
+    kv_bool(o, "simulated", st.simulated);
     kv_bool(o, "board_responding", st.board_responding);
     kv_str(o, "port", st.port);
     kv_int(o, "baud", st.baud);
@@ -2447,6 +2481,7 @@ void usage()
 "  --gui-dir DIR     SimpleBGC GUI install to read defaults from\n"
 "  --pad DEV         gamepad event device; omit to auto-detect\n"
 "  --no-pad          do not look for a gamepad\n"
+"  --simulate        no serial device; frames are built and shown, never sent\n"
 "  --probe-port DEV  ask one device whether it is a SimpleBGC, then exit\n"
 "                    (sends only CMD_BOARD_INFO; exit 0 if it answered)\n"
 "  --allow-control   permit the UI to arm motion commands (off by default)\n"
@@ -2506,6 +2541,7 @@ int main(int argc, char **argv)
         else if (a == "--gui-dir" && i + 1 < argc) opt.gui_dir = argv[++i];
         else if (a == "--pad" && i + 1 < argc) opt.pad_path = argv[++i];
         else if (a == "--probe-port" && i + 1 < argc) probe_port = argv[++i];
+        else if (a == "--simulate" || a == "-s") opt.simulate = true;
         else if (a == "--no-pad") opt.no_pad = true;
         else if (a == "--allow-control") opt.allow_control = true;
         // The old spelling stays accepted: it named the same intent, and
@@ -2544,6 +2580,8 @@ int main(int argc, char **argv)
         g_status.port = opt.port;
         g_status.baud = opt.baud;
         g_status.control_allowed = opt.allow_control;
+        g_status.simulated = opt.simulate;
+        if (opt.simulate) g_status.port = "(simulated — no serial device)";
         g_status.config_summary = gc.summary;
 
         // Built-in fallbacks, matching gimbal_ctl's defaults. These are only

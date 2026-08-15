@@ -15,6 +15,7 @@ about what reached the motors.
     ./test_gimbal_gui.py [--quick]     --quick skips the 20 s timeout case
 """
 
+import json
 import os
 import pty
 import select
@@ -27,7 +28,7 @@ import urllib.request
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from sbgc_sim import (Board, Daemon, Results, GUI_BIN, CMD_CONTROL,
-                      CMD_BOARD_INFO, quick_mode, require_binary)
+                      CMD_BOARD_INFO, free_port, quick_mode, require_binary)
 
 r = Results()
 
@@ -591,7 +592,80 @@ def test_a_missing_port_is_reported_not_papered_over():
         board.close()
 
 
+def test_simulate_needs_no_hardware_and_says_so():
+    """
+    gimbal_ctl has had --simulate since the start; the daemon had no
+    hardware-free mode at all, so there was no way to bring the console up and
+    see what it would send. Frames must be built and shown exactly as they
+    would go on the wire, nothing may be transmitted, and the page must never
+    be mistakable for a live board.
+    """
+    r.section("the daemon runs with no serial device")
+    port = free_port()
+    proc = subprocess.Popen(
+        [GUI_BIN, "--http-port", str(port), "--no-pad", "--simulate",
+         "--allow-control"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    base = f"http://127.0.0.1:{port}"
+
+    def status():
+        with urllib.request.urlopen(base + "/api/status", timeout=3) as f:
+            return json.load(f)
+
+    def post(path, body=""):
+        req = urllib.request.Request(base + path, data=body.encode(),
+                                     method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=3) as f:
+                return f.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        deadline = time.monotonic() + 8.0
+        s = None
+        while time.monotonic() < deadline:
+            try:
+                s = status()
+                break
+            except Exception:                                  # noqa: BLE001
+                time.sleep(0.05)
+        r.check("it serves the console with no device present", s is not None)
+        if s is None:
+            return
+
+        r.check("the link reports itself as simulated",
+                s["link"].get("simulated") is True, str(s["link"])[:200])
+        r.check("the operator is told before anything else",
+                s["warnings"] and "SIMULATION" in s["warnings"][0]["text"],
+                str(s["warnings"])[:200])
+
+        # Gating is not relaxed just because nothing is connected.
+        r.check("arming is still required before a rate is accepted",
+                post("/api/control/rate", "pan=1.0&tilt=0") == 403)
+
+        post("/api/arm", "armed=1")
+        for _ in range(6):
+            post("/api/control/rate", "pan=1.0&tilt=0")
+            time.sleep(0.05)
+        time.sleep(0.3)
+        c = status()["control"]
+        hexed = c.get("last_cmd_hex", "")
+        r.check("the exact frame it would have sent is shown",
+                hexed.startswith("3E 43 0F"), hexed)
+        r.check("carrying the commanded yaw rate",
+                "F6 00" in hexed, hexed)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 TESTS = [
+    (test_simulate_needs_no_hardware_and_says_so, False),
     (test_a_device_must_identify_itself_before_being_adopted, False),
     (test_a_missing_port_is_reported_not_papered_over, False),
     (test_stalled_connections_do_not_starve_the_control_path, False),

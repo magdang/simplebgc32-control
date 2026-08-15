@@ -136,7 +136,30 @@ warnings.
   --no-pad          disable host gamepad discovery
   --allow-control   allow the page to arm commands that change hardware state
   --no-calib-gyro   disable automatic gyro calibration on motors-on
+  --simulate        no serial device; frames are built and shown, never sent
+  --probe-port DEV  ask one device whether it is a SimpleBGC, then exit
 ```
+
+Start with simulation here too. The console comes up with no hardware attached
+and shows the exact bytes each control would put on the wire, while the arming
+rules stay exactly as they are against a real board:
+
+```bash
+./build/gimbal_gui --simulate --allow-control
+```
+
+If a re-plug has shuffled the `ttyUSB` numbering, ask a device directly rather
+than guessing which one moved. It sends only `CMD_BOARD_INFO` and exits 0 when
+the device answers as a SimpleBGC:
+
+```bash
+./build/gimbal_gui --probe-port /dev/ttyUSB1
+```
+
+The daemon applies the same rule to itself: if the configured port disappears,
+it adopts another device only after that device has identified itself. A robot
+usually carries more than one USB serial device, and following the wrong one
+would mean writing gimbal frames into a LiDAR.
 
 With no explicit port, baud, or GUI directory, the program looks for a local
 SimpleBGC GUI installation and reads `conf/bgc.properties` plus an exported
@@ -310,16 +333,19 @@ make test          # every suite (~45 s)
 make test-quick    # same, minus one 20 s timeout case
 ```
 
-Individual suites: `test-protocol`, `test-ctl`, `test-gui`, `test-page`.
+Individual suites: `test-protocol`, `test-modules`, `test-ctl`, `test-gui`,
+`test-page`.
 
 | Suite | File | Covers |
 |---|---|---|
 | protocol | `test/test_sbgc_api.c` | framing, encoding, parsing, unit conversion |
+| modules | `test/test_modules.c` | HTTP server, telemetry decoder, GUI-config discovery |
 | CLI | `test/test_gimbal_ctl.py` | `gimbal_ctl` frames under `--simulate` |
 | daemon | `test/test_gimbal_gui.py` | `gimbal_gui` against a simulated controller |
 | page | `test/test_web_page.js` | `web/index.html` control logic |
 
-The protocol suite is C and always runs. The others need `python3`, and the
+The protocol and module suites are C and always run. The others need
+`python3`, and the
 page suite needs `node`; a missing interpreter is reported as SKIPPED rather
 than passing silently.
 
@@ -371,6 +397,7 @@ src/gimbal_gui.cpp        browser console daemon
 web/index.html            browser UI compiled into gimbal_gui
 tools/sbgc_probe.c        strictly read-only board probe
 test/test_sbgc_api.c      protocol and parser tests
+test/test_modules.c       HTTP, telemetry decoder and GUI-config tests
 test/sbgc_sim.py          simulated controller on a pty, shared by the tests
 test/test_gimbal_ctl.py   CLI regression tests
 test/test_gimbal_gui.py   daemon regression tests
