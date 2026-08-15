@@ -135,7 +135,7 @@ warnings.
   --pad DEV         host gamepad event device; omit to auto-detect
   --no-pad          disable host gamepad discovery
   --allow-control   allow the page to arm commands that change hardware state
-  --no-calib-gyro   disable startup gyro calibration
+  --no-calib-gyro   disable automatic gyro calibration on motors-on
 ```
 
 With no explicit port, baud, or GUI directory, the program looks for a local
@@ -151,7 +151,10 @@ The console is read-only unless both of these independent conditions are met:
 2. the operator armed control in the web page.
 
 Without both, motion and hardware-changing endpoints return HTTP 403 without
-building a serial frame. The UI can control pan and tilt with pointer/touch,
+building a serial frame. The one exception is the automatic gyro calibration
+described below: it is gated on `--allow-control` but not on arming, because
+arming exists to gate operator-commanded motion and the calibration commands
+none. The UI can control pan and tilt with pointer/touch,
 `W A S D`, arrow keys, or a browser-connected gamepad. Roll is actively held at
 0 degrees rather than exposed as an operator axis.
 
@@ -176,12 +179,24 @@ than continuous rates.
 
 ### Gyroscope calibration
 
-When control is allowed, startup gyroscope calibration is enabled by default.
-Use `--no-calib-gyro` to disable it. The gimbal must remain completely still
-during calibration; movement can teach an incorrect bias and cause drift.
+When control is allowed, the gyroscope is calibrated every time the motors are
+switched on. Powering the motors is what invalidates the stored zero-rate bias,
+so it is the point at which recalibrating is worth doing. Use `--no-calib-gyro`
+to disable it; the page's Calibrate button still works either way.
+
+The gimbal must remain completely still during calibration — movement teaches an
+incorrect bias and causes drift. Motors-on is also the moment the gimbal grabs
+its position and settles, so the calibration is *armed* by motors-on but does
+not fire until the controller's own reported angles show it has stopped moving.
+If it never settles within 20 seconds the calibration is abandoned and reported,
+rather than run on a moving gimbal. While one is running, held controls are
+suppressed and no rate command is sent.
+
+This is separate from the controller's own calibration at power-on, which is a
+different and less frequent event; neither replaces the other.
+
 The displayed duration is an estimate, not a verified completion response from
-the board. Also check the controller's own startup-calibration setting before
-enabling a second calibration here.
+the board.
 
 ### Travel limits and angle handling
 
@@ -288,6 +303,39 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="XXXX", SYMLINK+="s
 Do not copy placeholder IDs unchanged. Add the operator to the appropriate
 serial-device group instead of running the controller as root.
 
+## Tests
+
+```bash
+make test          # every suite (~45 s)
+make test-quick    # same, minus one 20 s timeout case
+```
+
+Individual suites: `test-protocol`, `test-ctl`, `test-gui`, `test-page`.
+
+| Suite | File | Covers |
+|---|---|---|
+| protocol | `test/test_sbgc_api.c` | framing, encoding, parsing, unit conversion |
+| CLI | `test/test_gimbal_ctl.py` | `gimbal_ctl` frames under `--simulate` |
+| daemon | `test/test_gimbal_gui.py` | `gimbal_gui` against a simulated controller |
+| page | `test/test_web_page.js` | `web/index.html` control logic |
+
+The protocol suite is C and always runs. The others need `python3`, and the
+page suite needs `node`; a missing interpreter is reported as SKIPPED rather
+than passing silently.
+
+`test/sbgc_sim.py` simulates a SimpleBGC32 controller on a pseudo-terminal. It
+answers the queries the daemon sends and lets a test drive motor state and
+reported angles directly, so the daemon's behaviour can be checked when the
+hardware misbehaves — a controller that stops reporting mid-move, a calibration
+racing a held control — without hardware and without risk to a real gimbal.
+Assertions are made on the frames the simulated controller received, not on
+what the UI reports, because only the former is evidence about what would
+reach the motors.
+
+The page suite evaluates `web/index.html`'s own `<script>` block against a
+minimal DOM shim and drives it with synthetic events, so it tests the shipped
+page rather than a copy of its logic.
+
 ## Protocol verification
 
 `test/test_sbgc_api.c` contains 37 checks, including byte-for-byte comparisons
@@ -323,6 +371,10 @@ src/gimbal_gui.cpp        browser console daemon
 web/index.html            browser UI compiled into gimbal_gui
 tools/sbgc_probe.c        strictly read-only board probe
 test/test_sbgc_api.c      protocol and parser tests
+test/sbgc_sim.py          simulated controller on a pty, shared by the tests
+test/test_gimbal_ctl.py   CLI regression tests
+test/test_gimbal_gui.py   daemon regression tests
+test/test_web_page.js     browser UI regression tests
 ```
 
 ## Scope and non-goals

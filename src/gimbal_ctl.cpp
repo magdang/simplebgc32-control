@@ -30,10 +30,36 @@
 #include <string>
 #include <vector>
 
+#include <csignal>
 #include <termios.h>
 #include <unistd.h>
 
 namespace {
+
+// ------------------------------------------------------------- interrupts --
+
+/*
+ * Ctrl-C must not be the end of the story here. A direction command puts the
+ * board in SPEED mode and it runs until something recalls it; the board has no
+ * serial-loss failsafe of its own. Under the default SIGINT disposition the
+ * process dies before the stop at the bottom of main(), the port closes, and
+ * the camera keeps turning with nothing left alive to recall it.
+ *
+ * The handler does the only thing a handler may safely do: raise a flag. Every
+ * loop that can be sitting on the hardware checks it and unwinds through its
+ * normal exit path, and every one of those paths already sends a stop.
+ */
+volatile sig_atomic_t g_interrupted = 0;
+
+void on_interrupt(int) { g_interrupted = 1; }
+
+/*
+ * The fastest rate this tool will ever put on the wire. The 'speed' and
+ * direction commands refuse anything above it as implausible; the gamepad has
+ * to honour the same ceiling, or the one input that can reach it by accident
+ * is the one input exempt from it.
+ */
+const double MAX_RATE_DEG_S = 500.0;
 
 // ------------------------------------------------------------------ config --
 
@@ -67,7 +93,29 @@ struct Config {
 
     Config() {
         pan  = { SBGC_YAW,   false, -170.0, 170.0 };
-        tilt = { SBGC_PITCH, false,  -90.0,  40.0 };
+        /*
+         * TILT DEFAULTS TO INVERTED, and that is a protocol fact rather than a
+         * statement about anyone's mount.
+         *
+         * The board's PITCH axis is positive DOWNWARD. The 2.6x manual, RC
+         * Settings: "if you want to configure a camera to go only from a
+         * leveled position to down position, set min=0, max=90". The vendor's
+         * own CMD_CONTROL example agrees — "Rotate PITCH 90 degrees up"
+         * encodes 0xF000, i.e. -90 degrees.
+         *
+         * This tool works positive-up, because an operator typing "up" means
+         * up, so the two conventions differ by a sign on every board with a
+         * standard pitch axis. With invert left false, "up 30" tilted the
+         * camera DOWN, and the asymmetric soft limits below then applied to
+         * the wrong direction: "up" was bounded at 40 degrees while actually
+         * travelling down, and "down" was given 90 degrees of travel while
+         * actually going up — the hard-stop collision the file header warns
+         * about. gimbal_gui makes the same conversion in
+         * board_pitch_from_ui().
+         *
+         * Setup can still flip it for a mount that is genuinely reversed.
+         */
+        tilt = { SBGC_PITCH, true,  -90.0,  40.0 };
         roll = { SBGC_ROLL,  false,  -45.0,  45.0 };
     }
 };
@@ -122,6 +170,17 @@ bool parse_double(const std::string &s, double &out)
         size_t idx = 0;
         double v = std::stod(s, &idx);
         if (idx != s.size()) return false;
+        /*
+         * std::stod happily accepts "nan" and "inf". Neither survives contact
+         * with anything downstream: every range check here is a comparison,
+         * and all comparisons against NaN are false, so "speed nan" passes
+         * both `v <= 0` and `v > 500` and silently becomes the speed. From
+         * there it reaches the int16 cast in saturate_i16(), where converting
+         * a NaN is undefined behaviour. Refuse it at the door, where it can
+         * still be reported as the typo it is. gimbal_gui guards the same
+         * inputs with std::isfinite.
+         */
+        if (!std::isfinite(v)) return false;
         out = v;
         return true;
     } catch (...) {
@@ -157,9 +216,11 @@ int prompt_axis(const std::string &what, int def)
 
 // ------------------------------------------------------------------- setup --
 
-void configure_axis(const char *label, const char *positive_dir, AxisMap &m)
+void configure_axis(const char *label, const char *positive_dir, AxisMap &m,
+                    const char *note = nullptr)
 {
     std::cout << "\n-- " << label << " --\n";
+    if (note) std::cout << note;
     m.axis = prompt_axis(label, m.axis);
     m.invert = prompt_yes_no(
         std::string("  Is ") + positive_dir + " the NEGATIVE direction on this mount?",
@@ -193,7 +254,10 @@ void run_setup(Config &cfg)
         "here with 'setup' rather than compensating in your head.\n";
 
     configure_axis("PAN  (left/right)", "right", cfg.pan);
-    configure_axis("TILT (up/down)",    "up",    cfg.tilt);
+    configure_axis("TILT (up/down)",    "up",    cfg.tilt,
+        "  The board counts PITCH positive downward, so on a standard mount\n"
+        "  'up' really is the negative direction and the answer below is yes.\n"
+        "  Answer no only if this gimbal's pitch axis is physically reversed.\n");
     configure_axis("ROLL (horizon)",    "clockwise", cfg.roll);
 
     if (cfg.pan.axis == cfg.tilt.axis || cfg.pan.axis == cfg.roll.axis ||
@@ -467,7 +531,7 @@ void keyboard_mode(sbgc_t &sb, Config &cfg, State &st)
         note = any ? "step (clamped at soft limit)" : "step";
     };
 
-    while (running) {
+    while (running && !g_interrupted) {
         double now = monotonic_s();
         double dt = now - last_t;
         last_t = now;
@@ -623,7 +687,7 @@ void live_key_mode(sbgc_t &sb, const Config &cfg, State &st)
                  "  h = home, space = stop, q = quit back to the prompt.\n";
 
     bool running = true;
-    while (running) {
+    while (running && !g_interrupted) {
         unsigned char c;
         if (read(STDIN_FILENO, &c, 1) != 1) break;
 
@@ -715,7 +779,7 @@ void gamepad_mode(sbgc_t &sb, Config &cfg, State &st)
     double last_tx = 0.0;
     double last_t = monotonic_s();
 
-    while (running) {
+    while (running && !g_interrupted) {
         int pr = gp_poll(&gp, 10);
         if (pr < 0) {
             std::cout << "\n  " << gp_last_error(&gp) << " — stopping.\n";
@@ -741,9 +805,6 @@ void gamepad_mode(sbgc_t &sb, Config &cfg, State &st)
         if (!running) break;
 
         double now = monotonic_s();
-        double dt = now - last_t;
-        last_t = now;
-        if (dt > 0.5) dt = 0.5;         // ignore stalls (e.g. suspend)
 
         // --- edge-triggered buttons ---
         if (gp_button_pressed(&gp, GP_BTN_BACK)) running = false;
@@ -782,11 +843,32 @@ void gamepad_mode(sbgc_t &sb, Config &cfg, State &st)
         }
         if (!active) {
             active = true;
+            // Start the integration window here, not at whenever the mode was
+            // entered: the gap since the last transmission is idle time the
+            // gimbal spent stationary, and crediting it to the estimate would
+            // move the camera on paper while it sat still.
+            last_t = now;
             std::printf("\r  [deadman held]                              \n");
         }
 
         if (now - last_tx < period) continue;
+
+        /*
+         * dt spans the interval this rate will actually be in force — the gap
+         * between transmissions — not the gap between polls.
+         *
+         * The loop polls the pad every ~10 ms but only publishes at ~30 Hz.
+         * Advancing the estimate by the poll interval therefore credited about
+         * 10 ms of travel for every ~33 ms the gimbal really moved, so the
+         * open-loop soft limits engaged at roughly a third of the true angle
+         * — at 60 deg/s the camera had physically travelled some 500 degrees
+         * by the time the estimate reached a 170 degree limit, which is to say
+         * the limit did not work.
+         */
+        double dt = now - last_t;
+        last_t  = now;
         last_tx = now;
+        if (dt > 0.5) dt = 0.5;         // ignore stalls (e.g. suspend)
 
         // --- sticks and triggers to rates ---
         double lx = gp_axis_signed(&gp, GP_AX_LEFT_X,  cfg.deadzone);
@@ -799,10 +881,26 @@ void gamepad_mode(sbgc_t &sb, Config &cfg, State &st)
         double scale = cfg.speed_deg_s *
                        (gp_button(&gp, GP_BTN_RB) ? cfg.boost : 1.0);
 
+        /*
+         * Deflection is clamped to full scale before it becomes a rate, and
+         * the rate is then held to the tool's own ceiling.
+         *
+         * Both sticks add, so pushing them the same way gave 1 + fine_scale =
+         * 1.25 of "full" deflection, and the RB boost multiplied that again:
+         * 2.5x the configured speed from controls the on-screen legend
+         * describes as full speed plus a 2x boost. At the highest speed the
+         * 'speed' command accepts that reached 1250 deg/s — two and a half
+         * times the rate this tool refuses to be told to use.
+         */
+        auto clamp1 = [](double v) { return std::max(-1.0, std::min(1.0, v)); };
+        auto cap    = [](double v) {
+            return std::max(-MAX_RATE_DEG_S, std::min(MAX_RATE_DEG_S, v));
+        };
+
         // evdev sticks report Y positive downwards; negate so up is positive.
-        double pan  = (lx + rx * cfg.fine_scale) * scale;
-        double tilt = (-ly + -ry * cfg.fine_scale) * scale;
-        double roll = (rt - lt) * scale * cfg.roll_scale;
+        double pan  = cap(clamp1(lx + rx * cfg.fine_scale) * scale);
+        double tilt = cap(clamp1(-ly + -ry * cfg.fine_scale) * scale);
+        double roll = cap(clamp1(rt - lt) * scale * cfg.roll_scale);
 
         // --- open-loop soft-limit gating ---
         auto gate = [&](const AxisMap &m, double &pos, double &rate) {
@@ -1259,7 +1357,7 @@ bool handle(const std::vector<std::string> &tok, sbgc_t &sb,
             std::cout << "  (use 'stop' to halt, not a speed of 0)\n";
             return true;
         }
-        if (v > 500.0) {
+        if (v > MAX_RATE_DEG_S) {
             err_at(tok, 1, "speed " + tok[1] + " deg/s is implausibly high");
             std::cout << "  refusing; typical values are 20-120 deg/s\n";
             return true;
@@ -1296,7 +1394,7 @@ bool handle(const std::vector<std::string> &tok, sbgc_t &sb,
             std::cout << "  (direction comes from the command, not the sign)\n";
             return true;
         }
-        if (r > 500.0) {
+        if (r > MAX_RATE_DEG_S) {
             err_at(tok, 1, "rate " + tok[1] + " deg/s is implausibly high");
             return true;
         }
@@ -1456,13 +1554,32 @@ int main(int argc, char **argv)
         std::cout << "Opened " << cfg.port << " at " << cfg.baud << ".\n";
     }
 
+    /*
+     * Installed here, not earlier: setup moves nothing, so a Ctrl-C during it
+     * has nothing to recall and the default disposition is the right one. From
+     * this point on the port is open and a rate can be in flight.
+     *
+     * Deliberately no SA_RESTART. The blocking read inside getline() must fail
+     * with EINTR rather than resume, or a Ctrl-C at the prompt would go
+     * unnoticed until the operator happened to press Return.
+     */
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_interrupt;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT,  &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+    }
+
     print_help();
 
     State st;
     bool quit = false;
     std::string line;
 
-    while (!quit) {
+    while (!quit && !g_interrupted) {
         std::cout << "gimbal> " << std::flush;
         if (!std::getline(std::cin, line)) break;
 
@@ -1485,7 +1602,17 @@ int main(int argc, char **argv)
         sbgc_poll(&sb, 0, on_frame, nullptr);
     }
 
-    sbgc_stop(&sb);
+    if (g_interrupted) std::cout << "\ninterrupted — stopping the gimbal\n";
+
+    /*
+     * The last thing this process does while it still holds the port. A stop
+     * that could not be written is the one case where the operator has to be
+     * told plainly: nothing else is going to recall the board.
+     */
+    if (sbgc_stop(&sb) != 0)
+        std::cerr << "WARNING: could not send the stop: " << sbgc_last_error(&sb)
+                  << "\n         The gimbal may still be moving. Cut power to "
+                     "the board or stop it from the SimpleBGC GUI.\n";
     sbgc_close(&sb);
     std::cout << "Bye.\n";
     return 0;

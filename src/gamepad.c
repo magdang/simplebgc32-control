@@ -87,6 +87,21 @@ static int btn_code_to_slot(int code)
     }
 }
 
+static int slot_to_btn_code(int slot)
+{
+    switch (slot) {
+        case GP_BTN_A:     return BTN_SOUTH;
+        case GP_BTN_B:     return BTN_EAST;
+        case GP_BTN_X:     return BTN_WEST;
+        case GP_BTN_Y:     return BTN_NORTH;
+        case GP_BTN_LB:    return BTN_TL;
+        case GP_BTN_RB:    return BTN_TR;
+        case GP_BTN_BACK:  return BTN_SELECT;
+        case GP_BTN_START: return BTN_START;
+        default:           return -1;
+    }
+}
+
 /* ------------------------------------------------------------------- find -- */
 
 /* A gamepad, for our purposes, has the A button and at least a left stick. */
@@ -241,11 +256,58 @@ const char *gp_name(const gp_t *gp)
 
 /* ------------------------------------------------------------------- poll -- */
 
+/*
+ * Re-read the whole device state straight from the kernel, discarding whatever
+ * we believed. Required after SYN_DROPPED, where the kernel's per-client queue
+ * overflowed and it threw events away: the release we never saw is simply
+ * gone, and no amount of further reading will produce it.
+ *
+ * This matters more here than in a typical evdev client. The event lost may be
+ * the release of the deadman button, and a deadman latched down is a camera
+ * that keeps turning with the operator's thumb off the controller — the one
+ * failure the deadman exists to prevent. Where the state cannot be read back
+ * at all, everything is treated as released rather than assumed unchanged.
+ */
+static void gp_resync(gp_t *gp)
+{
+    unsigned long keys[NBITS(KEY_MAX)];
+    memset(keys, 0, sizeof(keys));
+
+    if (ioctl(gp->fd, EVIOCGKEY((int)sizeof(keys)), keys) >= 0) {
+        for (int slot = 0; slot < GP_BTN_COUNT; slot++) {
+            int code = slot_to_btn_code(slot);
+            if (code >= 0) gp->button[slot] = test_bit(keys, code) ? 1 : 0;
+        }
+    } else {
+        memset(gp->button, 0, sizeof(gp->button));   /* fail closed */
+    }
+
+    for (int slot = 0; slot < GP_AX_COUNT; slot++) {
+        if (!gp->axis[slot].present) continue;
+        int code = slot_to_abs_code(slot);
+        if (code < 0) continue;
+
+        unsigned ucode = (unsigned)code;
+        struct input_absinfo info;
+        if (ioctl(gp->fd, EVIOCGABS(ucode), &info) == 0) {
+            gp->axis[slot].value = info.value;
+        } else {
+            /* Unknown: fall back to the axis's resting position — centred for
+             * a stick or hat, fully released for a trigger. */
+            gp->axis[slot].value =
+                (slot == GP_AX_LTRIGGER || slot == GP_AX_RTRIGGER)
+                    ? gp->axis[slot].min
+                    : (gp->axis[slot].min + gp->axis[slot].max) / 2;
+        }
+    }
+}
+
 int gp_poll(gp_t *gp, int timeout_ms)
 {
     if (!gp || gp->fd < 0) return -1;
 
     int consumed = 0;
+    int dropped  = 0;      /* inside a torn packet, waiting for SYN_REPORT */
     struct pollfd pfd = { gp->fd, POLLIN, 0 };
 
     for (;;) {
@@ -276,6 +338,24 @@ int gp_poll(gp_t *gp, int timeout_ms)
 
         size_t n = (size_t)r / sizeof(struct input_event);
         for (size_t i = 0; i < n; i++) {
+            /*
+             * SYN_DROPPED says the queue overflowed. Everything from here to
+             * the next SYN_REPORT is the tail of a packet whose start was
+             * discarded, so it describes no coherent state and is skipped;
+             * the state we missed is then read back from the device.
+             */
+            if (ev[i].type == EV_SYN) {
+                if (ev[i].code == SYN_DROPPED) {
+                    dropped = 1;
+                } else if (ev[i].code == SYN_REPORT && dropped) {
+                    dropped = 0;
+                    gp_resync(gp);
+                    consumed++;
+                }
+                continue;
+            }
+            if (dropped) continue;
+
             if (ev[i].type == EV_ABS) {
                 int slot = abs_code_to_slot(ev[i].code);
                 if (slot >= 0 && gp->axis[slot].present) {
@@ -292,6 +372,17 @@ int gp_poll(gp_t *gp, int timeout_ms)
             }
         }
         timeout_ms = 0;   /* drain the rest without blocking again */
+    }
+
+    /*
+     * An overrun whose closing SYN_REPORT has not arrived yet — it can land in
+     * the next read. Resync now regardless: waiting would mean carrying the
+     * stale button state, possibly a stuck deadman, until it turns up, and a
+     * resync is a valid state to hold at any point.
+     */
+    if (dropped) {
+        gp_resync(gp);
+        consumed++;
     }
     return consumed;
 }

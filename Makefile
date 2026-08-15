@@ -1,11 +1,23 @@
 # simplebgc32-control — standalone SimpleBGC gimbal control. No ROS dependency.
 #
 #   make            build gimbal_ctl, gimbal_gui and the test binary
-#   make test       build and run the protocol tests
+#   make test       build and run every test (~40 s; see below)
+#   make test-quick same, minus the one slow case (~15 s)
 #   make run        build and start the CLI in simulation mode (no hardware)
 #   make gui        build and start the status console, then open a browser
 #   make probe      build the read-only board prober
 #   make clean
+#
+# Individual suites: test-protocol, test-ctl, test-gui, test-page.
+#
+# The protocol suite is C and always runs. The other three need python3 (and
+# node for the page); where an interpreter is missing that suite is SKIPPED
+# with a note rather than silently passing — a test that did not run is not a
+# test that passed.
+#
+# test-gui drives the real daemon against a simulated controller on a pty, so
+# it needs no hardware and cannot touch a real gimbal. Its slow case waits out
+# the 20 s "gimbal never settled" timeout; test-quick skips just that one.
 
 CC       ?= cc
 CXX      ?= c++
@@ -20,7 +32,11 @@ GUI   := $(BUILD)/gimbal_gui
 PROBE := $(BUILD)/sbgc_probe
 TEST  := $(BUILD)/test_sbgc_api
 
-.PHONY: all test run gui probe clean
+PYTHON ?= python3
+NODE   ?= node
+
+.PHONY: all test test-quick test-protocol test-ctl test-gui test-page \
+        run gui probe clean
 
 all: $(BIN) $(GUI) $(TEST)
 
@@ -72,8 +88,44 @@ $(PROBE): tools/sbgc_probe.c $(BUILD)/sbgc_api.o | $(BUILD)
 $(TEST): test/test_sbgc_api.c $(BUILD)/sbgc_api.o | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
-test: $(TEST)
+test: test-protocol test-page test-ctl test-gui
+	@printf "\nAll suites that ran passed (a SKIPPED suite above did not run).\n"
+
+# Same coverage minus the case that waits out a 20 s timeout, for the
+# edit-build-test loop. Everything else runs.
+test-quick: GUI_TEST_ARGS := --quick
+test-quick: test-protocol test-page test-ctl test-gui
+	@printf "\nAll suites that ran passed; slow cases skipped.\n"
+
+test-protocol: $(TEST)
+	@echo "=== protocol (test_sbgc_api.c) ==="
 	@./$(TEST)
+
+test-ctl: $(BIN)
+	@printf "\n=== CLI (test_gimbal_ctl.py) ===\n"
+	@if command -v $(PYTHON) >/dev/null 2>&1; then \
+	    $(PYTHON) test/test_gimbal_ctl.py; \
+	else \
+	    echo "SKIPPED: $(PYTHON) not found"; \
+	fi
+
+test-gui: $(GUI)
+	@printf "\n=== daemon (test_gimbal_gui.py) ===\n"
+	@if command -v $(PYTHON) >/dev/null 2>&1; then \
+	    $(PYTHON) test/test_gimbal_gui.py $(GUI_TEST_ARGS); \
+	else \
+	    echo "SKIPPED: $(PYTHON) not found"; \
+	fi
+
+# Depends on the page itself, not on a binary: it evaluates web/index.html's
+# own <script> block rather than anything compiled.
+test-page: web/index.html
+	@printf "\n=== page (test_web_page.js) ===\n"
+	@if command -v $(NODE) >/dev/null 2>&1; then \
+	    $(NODE) test/test_web_page.js; \
+	else \
+	    echo "SKIPPED: $(NODE) not found"; \
+	fi
 
 run: $(BIN)
 	@./$(BIN) --simulate
