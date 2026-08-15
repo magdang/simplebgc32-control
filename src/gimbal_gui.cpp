@@ -916,8 +916,26 @@ void serial_thread(Options opt)
                  */
                 have_angle    = g_status.have_rt &&
                                 (monotonic_s() - g_status.rt_stamp) < ANGLE_FRESH_S;
-                yaw_now       = g_status.rt.imu_deg[SBGC_YAW];
-                pitch_now     = ui_pitch_from_board(g_status.rt.imu_deg[SBGC_PITCH]);
+                /*
+                 * Gated on the board's UNWRAPPED count, not on the display
+                 * angle.
+                 *
+                 * imu_deg is folded into (-180, 180] so the UI never shows an
+                 * attitude no mount could reach, and that fold is a
+                 * discontinuity. A gimbal at a true +200 deg reads as -160,
+                 * which lands back inside a [-170, 170] range: the gate stops
+                 * seeing a limit at all and the axis runs on for most of a
+                 * turn before the wrapped value comes round to block it again.
+                 *
+                 * imu_units is the board's own continuous count.
+                 * sbgc_params.h already requires it for anything that becomes
+                 * a command target, and a limit decision is the same kind of
+                 * use — it has to name where the axis physically is, not where
+                 * it appears on a dial.
+                 */
+                yaw_now   = sbgc_units_to_deg(g_status.rt.imu_units[SBGC_YAW]);
+                pitch_now = ui_pitch_from_board(
+                                sbgc_units_to_deg(g_status.rt.imu_units[SBGC_PITCH]));
                 if (!g_status.motion_active) {
                     g_status.limit_blocked_yaw = g_status.limit_blocked_pitch = false;
                     g_status.limit_stale = false;

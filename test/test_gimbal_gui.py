@@ -309,7 +309,69 @@ def test_limits_round_trip_without_changing():
         board.close()
 
 
+def yaw_speeds(board):
+    """Commanded YAW speed from each CMD_CONTROL frame the board received.
+
+    Not moving_controls(): every rate frame also carries a non-zero ROLL slew,
+    because roll is actively held level rather than merely left alone, so a
+    frame with yaw fully blocked still counts as "moving" by that measure.
+    """
+    return [c["speed"][2] for c in board.snapshot("controls")]
+
+
+def test_yaw_limits_use_the_unwrapped_angle():
+    """
+    imu_deg is folded into (-180, 180] so the UI never shows an attitude no
+    mount could reach. The travel-limit gate used that folded value, so a
+    gimbal at a true +200 deg read as -160 — comfortably back inside a
+    [-170, 170] range. The limit stopped existing in the direction that
+    mattered, and the axis could run on for most of a turn before the wrapped
+    reading came round to block it again.
+    """
+    r.section("yaw travel limits are gated on the unwrapped angle")
+    # 200 deg is 30 past the maximum, and wraps to -160: inside the range.
+    board = Board(motors_on=True, angles=(0.0, 0.0, 200.0))
+    d = Daemon(board, ["--allow-control", "--no-calib-gyro"])
+    try:
+        d.post("/api/arm", "armed=1")
+        d.post("/api/limits",
+               "enabled=1&yaw_min=-170&yaw_max=170&pitch_min=-45&pitch_max=30")
+
+        board.clear("controls")
+        d.hold_rate(0.6, "pan=1.0&tilt=0")
+        ys = yaw_speeds(board)
+        r.check("panning further past the limit is blocked",
+                ys and all(s == 0 for s in ys), f"yaw speeds {ys}")
+        r.check("the block is reported to the UI",
+                d.control().get("blocked_yaw") is True, str(d.control())[:200])
+
+        # Recovery must stay available, or a gimbal that overshot is stuck.
+        board.clear("controls")
+        d.hold_rate(0.6, "pan=-1.0&tilt=0")
+        ys = yaw_speeds(board)
+        r.check("panning back toward the range is still allowed",
+                any(s < 0 for s in ys), f"yaw speeds {ys}")
+
+        # The mirror case, past the minimum rather than the maximum. Wait for
+        # the daemon to actually observe the new angle first: telemetry is a
+        # round-trip, and frames sent against the previous reading are not
+        # evidence about the gate.
+        board.set(angles=(0.0, 0.0, -200.0))
+        d.await_status(
+            lambda st: abs(st["telemetry"]["angles"]["yaw"]["imu"] - 160.0) < 1.0,
+            3.0, "the -200 deg yaw reading to arrive (wraps to +160)")
+        board.clear("controls")
+        d.hold_rate(0.6, "pan=-1.0&tilt=0")
+        ys = yaw_speeds(board)
+        r.check("the same holds below the minimum",
+                ys and all(s == 0 for s in ys), f"yaw speeds {ys}")
+    finally:
+        d.close()
+        board.close()
+
+
 TESTS = [
+    (test_yaw_limits_use_the_unwrapped_angle, False),
     (test_cross_origin_requests_are_refused, False),
     (test_limits_round_trip_without_changing, False),
     (test_board_pitch_limits_are_converted, False),
