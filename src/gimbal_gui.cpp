@@ -131,6 +131,14 @@ struct Status {
     bool              have_info = false;
     sbgc_board_info_t info{};
 
+    /*
+     * The measured pitch and yaw unwrapped onto a continuous track, in the
+     * UI's own convention (pitch positive up). This, not the wrapped display
+     * angle, is what travel limits are judged against — see unwrap_onto.
+     */
+    bool   angle_cont_valid = false;
+    double yaw_cont = 0.0, pitch_cont = 0.0;
+
     // live telemetry
     bool            have_rt = false;
     sbgc_realtime_t rt{};
@@ -286,6 +294,35 @@ std::atomic<bool> g_running{true};
  * convention: +1 is up. The two meet here and nowhere else. Every UI-facing
  * pitch number — commands, telemetry, travel limits — passes through this.
  */
+/*
+ * Advance a continuous angle track with a newly arrived wrapped reading.
+ *
+ * The board's reported angles are folded into (-180, 180] for display, and a
+ * travel limit cannot be evaluated across that fold: the number jumps 360 deg
+ * while the axis moves a fraction of a degree. Seeding a track from the first
+ * reading and advancing it by the shortest step to each subsequent one gives
+ * an angle that is continuous through the fold AND still expressed in the
+ * frame the operator set the limits in.
+ *
+ * Using the board's raw unwrapped count instead would be continuous but would
+ * not agree with the display: a gimbal sitting at a raw 350 deg shows -10 deg,
+ * and a [-170, 170] limit would then block a direction the operator can see is
+ * free.
+ */
+double unwrap_onto(double cont, double wrapped)
+{
+    double d = wrapped - std::fmod(cont, 360.0);
+    while (d > 180.0)   d -= 360.0;
+    while (d <= -180.0) d += 360.0;
+    return cont + d;
+}
+
+/* Shortest angular distance between two wrapped readings. */
+double angle_gap(double a, double b)
+{
+    return std::fabs(std::fmod(a - b + 540.0, 360.0) - 180.0);
+}
+
 double ui_pitch_from_board(double board_deg) { return -board_deg; }
 double board_pitch_from_ui(double ui_deg)    { return -ui_deg; }
 
@@ -327,6 +364,16 @@ void on_frame(uint8_t cmd, const uint8_t *payload, size_t len, void *user)
         case SBGC_CMD_REALTIME_DATA_3: {
             sbgc_realtime_t rt;
             if (sbgc_parse_realtime_3(payload, len, &rt) == 0) {
+                double yaw_w   = rt.imu_deg[SBGC_YAW];
+                double pitch_w = ui_pitch_from_board(rt.imu_deg[SBGC_PITCH]);
+                if (!st->angle_cont_valid) {
+                    st->yaw_cont   = yaw_w;
+                    st->pitch_cont = pitch_w;
+                    st->angle_cont_valid = true;
+                } else {
+                    st->yaw_cont   = unwrap_onto(st->yaw_cont,   yaw_w);
+                    st->pitch_cont = unwrap_onto(st->pitch_cont, pitch_w);
+                }
                 st->rt = rt;
                 st->have_rt = true;
                 st->rt_stamp = monotonic_s();
@@ -599,6 +646,7 @@ void serial_thread(Options opt)
                 g_status.have_params = false;
                 g_status.have_info   = false;
                 g_status.have_rt     = false;
+                g_status.angle_cont_valid = false;
                 g_status.board_responding = false;
                 was_moving_before_change = g_status.motion_active;
                 g_status.motion_active = false;
@@ -794,8 +842,12 @@ void serial_thread(Options opt)
                     last_still_stamp = stamp;
                     double moved = 0.0;
                     if (have_prev_angle) {
+                        /* Shortest step, not the raw difference: a hair of
+                         * movement across the display fold reads as 360 deg
+                         * and would keep a perfectly still gimbal from ever
+                         * being judged settled. */
                         for (int a = 0; a < SBGC_NUM_AXES; a++)
-                            moved = std::max(moved, std::fabs(angle[a] - prev_angle[a]));
+                            moved = std::max(moved, angle_gap(angle[a], prev_angle[a]));
                     }
                     for (int a = 0; a < SBGC_NUM_AXES; a++) prev_angle[a] = angle[a];
 
@@ -914,7 +966,7 @@ void serial_thread(Options opt)
                  * limit against that reading lets the camera drive straight
                  * through it, because the number never moves.
                  */
-                have_angle    = g_status.have_rt &&
+                have_angle    = g_status.have_rt && g_status.angle_cont_valid &&
                                 (monotonic_s() - g_status.rt_stamp) < ANGLE_FRESH_S;
                 /*
                  * Gated on the board's UNWRAPPED count, not on the display
@@ -933,9 +985,8 @@ void serial_thread(Options opt)
                  * use — it has to name where the axis physically is, not where
                  * it appears on a dial.
                  */
-                yaw_now   = sbgc_units_to_deg(g_status.rt.imu_units[SBGC_YAW]);
-                pitch_now = ui_pitch_from_board(
-                                sbgc_units_to_deg(g_status.rt.imu_units[SBGC_PITCH]));
+                yaw_now   = g_status.yaw_cont;
+                pitch_now = g_status.pitch_cont;
                 if (!g_status.motion_active) {
                     g_status.limit_blocked_yaw = g_status.limit_blocked_pitch = false;
                     g_status.limit_stale = false;

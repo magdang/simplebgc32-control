@@ -321,28 +321,47 @@ def yaw_speeds(board):
     return [c["speed"][2] for c in board.snapshot("controls")]
 
 
-def test_yaw_limits_use_the_unwrapped_angle():
+def test_yaw_limits_survive_the_display_fold():
     """
-    imu_deg is folded into (-180, 180] so the UI never shows an attitude no
-    mount could reach. The travel-limit gate used that folded value, so a
-    gimbal at a true +200 deg read as -160 — comfortably back inside a
-    [-170, 170] range. The limit stopped existing in the direction that
-    mattered, and the axis could run on for most of a turn before the wrapped
-    reading came round to block it again.
+    Reported angles are folded into (-180, 180] for display, and a travel
+    limit cannot be evaluated across that fold: the number jumps 360 deg while
+    the axis moves a fraction of a degree. A gimbal that travelled out to 195
+    deg read as -165, comfortably inside a [-170, 170] range, so the limit
+    stopped existing in the direction that mattered.
+
+    The limit is judged on a continuous track instead — seeded from the first
+    reading and advanced by the shortest step to each next one, so it stays in
+    the same frame the operator set the limits in.
     """
-    r.section("yaw travel limits are gated on the unwrapped angle")
-    # 200 deg is 30 past the maximum, and wraps to -160: inside the range.
-    board = Board(motors_on=True, angles=(0.0, 0.0, 200.0))
+    r.section("yaw travel limits survive the display fold")
+    board = Board(motors_on=True, angles=(0.0, 0.0, 150.0))
     d = Daemon(board, ["--allow-control", "--no-calib-gyro"])
     try:
         d.post("/api/arm", "armed=1")
         d.post("/api/limits",
                "enabled=1&yaw_min=-170&yaw_max=170&pitch_min=-45&pitch_max=30")
 
+        # Inside the range to begin with: motion must be free.
+        board.clear("controls")
+        d.hold_rate(0.4, "pan=1.0&tilt=0")
+        r.check("motion is allowed while inside the range",
+                any(s > 0 for s in yaw_speeds(board)),
+                f"yaw speeds {yaw_speeds(board)}")
+
+        # Now walk the axis out past the limit and through the fold. Each step
+        # is well under 180 deg, which is what makes the unwrapping unambiguous.
+        for deg in (165.0, 175.0, 185.0, 195.0):
+            board.set(angles=(0.0, 0.0, deg))
+            wrapped = deg - 360.0 if deg > 180.0 else deg
+            d.await_status(
+                lambda st, w=wrapped:
+                    abs(st["telemetry"]["angles"]["yaw"]["imu"] - w) < 1.0,
+                3.0, f"the {deg} deg reading to arrive")
+
         board.clear("controls")
         d.hold_rate(0.6, "pan=1.0&tilt=0")
         ys = yaw_speeds(board)
-        r.check("panning further past the limit is blocked",
+        r.check("past the limit and through the fold, outward is blocked",
                 ys and all(s == 0 for s in ys), f"yaw speeds {ys}")
         r.check("the block is reported to the UI",
                 d.control().get("blocked_yaw") is True, str(d.control())[:200])
@@ -350,23 +369,41 @@ def test_yaw_limits_use_the_unwrapped_angle():
         # Recovery must stay available, or a gimbal that overshot is stuck.
         board.clear("controls")
         d.hold_rate(0.6, "pan=-1.0&tilt=0")
-        ys = yaw_speeds(board)
         r.check("panning back toward the range is still allowed",
-                any(s < 0 for s in ys), f"yaw speeds {ys}")
+                any(s < 0 for s in yaw_speeds(board)),
+                f"yaw speeds {yaw_speeds(board)}")
+    finally:
+        d.close()
+        board.close()
 
-        # The mirror case, past the minimum rather than the maximum. Wait for
-        # the daemon to actually observe the new angle first: telemetry is a
-        # round-trip, and frames sent against the previous reading are not
-        # evidence about the gate.
-        board.set(angles=(0.0, 0.0, -200.0))
-        d.await_status(
-            lambda st: abs(st["telemetry"]["angles"]["yaw"]["imu"] - 160.0) < 1.0,
-            3.0, "the -200 deg yaw reading to arrive (wraps to +160)")
+
+def test_limits_follow_the_displayed_angle_not_the_raw_count():
+    """
+    The board's raw count and the operator's view are different coordinates.
+    A gimbal sitting at a raw 350 deg displays as -10, which is inside a
+    [-170, 170] range, so both directions must be free. Gating on the raw
+    count instead would block panning further positive on a camera the
+    operator can see is nowhere near its limit.
+    """
+    r.section("limits are read in the operator's frame, not the board's")
+    board = Board(motors_on=True, angles=(0.0, 0.0, 350.0))
+    d = Daemon(board, ["--allow-control", "--no-calib-gyro"])
+    try:
+        d.post("/api/arm", "armed=1")
+        d.post("/api/limits",
+               "enabled=1&yaw_min=-170&yaw_max=170&pitch_min=-45&pitch_max=30")
+        s = d.status()
+        r.check("the board reports it as -10 deg",
+                abs(s["telemetry"]["angles"]["yaw"]["imu"] + 10.0) < 1.0,
+                str(s["telemetry"]["angles"]["yaw"]))
+
         board.clear("controls")
-        d.hold_rate(0.6, "pan=-1.0&tilt=0")
-        ys = yaw_speeds(board)
-        r.check("the same holds below the minimum",
-                ys and all(s == 0 for s in ys), f"yaw speeds {ys}")
+        d.hold_rate(0.6, "pan=1.0&tilt=0")
+        r.check("panning positive is allowed",
+                any(v > 0 for v in yaw_speeds(board)),
+                f"yaw speeds {yaw_speeds(board)}")
+        r.check("nothing is reported as blocked",
+                d.control().get("blocked_yaw") is False, str(d.control())[:200])
     finally:
         d.close()
         board.close()
@@ -442,7 +479,8 @@ def test_stalled_connections_do_not_starve_the_control_path():
 
 TESTS = [
     (test_stalled_connections_do_not_starve_the_control_path, False),
-    (test_yaw_limits_use_the_unwrapped_angle, False),
+    (test_yaw_limits_survive_the_display_fold, False),
+    (test_limits_follow_the_displayed_angle_not_the_raw_count, False),
     (test_cross_origin_requests_are_refused, False),
     (test_limits_round_trip_without_changing, False),
     (test_board_pitch_limits_are_converted, False),
