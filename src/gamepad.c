@@ -413,8 +413,18 @@ double gp_axis_signed(const gp_t *gp, int ax, double deadzone)
      */
     double dz = deadzone;
     if (a->flat > 0) {
+        /*
+         * A device claiming a flat region that swallows most of its own travel
+         * is describing something unusable, and taking it at face value would
+         * kill the stick. Cap what will be accepted from the device rather
+         * than either trusting it blindly or — as this did — discarding an
+         * over-large figure entirely and silently falling back to the caller's,
+         * which contradicts the floor this is documented to be.
+         */
+        const double KERNEL_DZ_MAX = 0.5;
         double kernel_dz = (double)a->flat / half;
-        if (kernel_dz > dz && kernel_dz < 1.0) dz = kernel_dz;
+        if (kernel_dz > KERNEL_DZ_MAX) kernel_dz = KERNEL_DZ_MAX;
+        if (kernel_dz > dz) dz = kernel_dz;
     }
 
     if (dz > 0.0 && dz < 1.0) {

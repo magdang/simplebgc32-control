@@ -84,15 +84,16 @@ $(GUI): $(BUILD)/gimbal_gui.o $(BUILD)/sbgc_api.o $(BUILD)/sbgc_params.o \
         $(BUILD)/sbgc_gui_config.o $(BUILD)/httpd.o $(BUILD)/gamepad.o
 	$(CXX) $^ -o $@ $(LDLIBS) -lpthread
 
-$(PROBE): tools/sbgc_probe.c $(BUILD)/sbgc_api.o | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+$(PROBE): tools/sbgc_probe.c include/sbgc_api.h include/sbgc_params.h \
+          $(BUILD)/sbgc_api.o | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(filter %.c %.o,$^) -o $@ $(LDLIBS)
 
 $(TEST): test/test_sbgc_api.c $(BUILD)/sbgc_api.o | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
 $(TESTMOD): test/test_modules.c $(BUILD)/httpd.o $(BUILD)/sbgc_params.o \
             $(BUILD)/sbgc_gui_config.o $(BUILD)/sbgc_api.o | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(filter %.c %.o,$^) -o $@ $(LDLIBS)
 
 # A suite that could not run leaves a marker here, so the summary below can
 # name what was missed instead of hedging unconditionally. Each suite clears

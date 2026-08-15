@@ -173,7 +173,7 @@ static void test_params(void)
 
     b[46] = 30;                     /* gyro trust, verified value       */
     b[48] = 2;                      /* pwm freq, verified value         */
-    b[49] = 0;                      /* serial speed index 0 = 115200    */
+    b[49] = 2;                      /* serial speed index 2 = 38400     */
     b[78] = 1;                      /* skip gyro calib                  */
     put16(b + 91, -1080);           /* battery alarm, verified value    */
     put16(b + 93,  -990);           /* battery motors-off               */
@@ -197,6 +197,11 @@ static void test_params(void)
           p.rc[SBGC_YAW].rc_max_angle == 170, NULL);
     check("gyro trust and pwm freq decode",
           p.gyro_trust == 30 && p.pwm_freq == 2, NULL);
+    /* A distinctive value: a zero-filled buffer satisfies == 0 no matter which
+     * offset the decoder actually read, so zero would pin nothing. */
+    check("serial speed is read from its own offset",
+          p.serial_speed == 2 &&
+          strcmp(sbgc_serial_speed_name(p.serial_speed), "38400") == 0, NULL);
     check("battery thresholds decode as signed",
           p.bat_threshold_alarm == -1080 && p.bat_threshold_motors == -990,
           NULL);
@@ -339,6 +344,11 @@ static void record(const httpd_request_t *req, httpd_response_t *resp, void *u)
 static int exchange(httpd_t *h, int port, const char *req, size_t req_len,
                     struct hit *hit, char *reply, size_t reply_cap)
 {
+    /* Cleared up front. Returning early while leaving the previous reply in
+     * the buffer lets a later assertion pass on an older response — a 413 from
+     * one case satisfying the next case's 413 check. */
+    if (reply_cap) reply[0] = '\0';
+
     int c = socket(AF_INET, SOCK_STREAM, 0);
     if (c < 0) return -1;
 
@@ -353,10 +363,17 @@ static int exchange(httpd_t *h, int port, const char *req, size_t req_len,
 
     for (int i = 0; i < 200 && hit->calls == 0; i++) httpd_serve(h, 10, record, hit);
 
+    /* Keep pumping and reading until the reply really stops arriving, not
+     * until the first quiet 20 ms — under load a scheduling gap is not the
+     * end of a response, and treating it as one makes the suite flaky. */
     size_t used = 0;
-    for (int i = 0; i < 50 && used + 1 < reply_cap; i++) {
+    int quiet = 0;
+    for (int i = 0; i < 300 && used + 1 < reply_cap && quiet < 25; i++) {
         struct pollfd p = { c, POLLIN, 0 };
-        if (poll(&p, 1, 20) <= 0) break;
+        int pr = poll(&p, 1, 20);
+        if (pr == 0) { quiet++; httpd_serve(h, 5, record, hit); continue; }
+        if (pr < 0) break;
+        quiet = 0;
         ssize_t n = read(c, reply + used, reply_cap - used - 1);
         if (n <= 0) break;
         used += (size_t)n;
@@ -477,6 +494,27 @@ static void test_http_requests(void)
               hit.calls == 1 && strcmp(hit.body, "pan=1") == 0, hit.body);
     }
 
+    /* Digits must be the whole value: "5junk" used to parse as 5. */
+    memset(&hit, 0, sizeof(hit));
+    {
+        const char *suffix =
+            "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5junk\r\n\r\npan=1";
+        exchange(&h, port, suffix, strlen(suffix), &hit, reply, sizeof(reply));
+        check("a trailing-garbage Content-Length is refused",
+              strstr(reply, "413") != NULL && hit.calls == 0, reply);
+    }
+
+    /* Two headers disagreeing about the length is never legitimate. */
+    memset(&hit, 0, sizeof(hit));
+    {
+        const char *dup =
+            "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n"
+            "Content-Length: 9\r\n\r\npan=1";
+        exchange(&h, port, dup, strlen(dup), &hit, reply, sizeof(reply));
+        check("a duplicated Content-Length is refused",
+              strstr(reply, "413") != NULL && hit.calls == 0, reply);
+    }
+
     /*
      * Connections that never finish must not stop later ones being served.
      * This is the starvation defect: the server used to read each connection
@@ -570,8 +608,40 @@ static void test_gui_config(void)
         "  </profile>\n"
         "</all-profiles>\n");
 
+    /*
+     * Stage a COMPETING install where the automatic scan looks, and point HOME
+     * at it, before asking for the fixture explicitly. Without this the
+     * precedence check proves nothing: on a machine with no SimpleBGC GUI
+     * installed — a container, or CI — the scan finds nothing to override with
+     * and the test passes even with the bug present.
+     */
+    char fake_home[] = "/tmp/sbgc_home_XXXXXX";
+    const char *real_home = getenv("HOME");
+    char saved_home[512] = "";
+    if (real_home) snprintf(saved_home, sizeof(saved_home), "%s", real_home);
+
+    int staged = 0;
+    if (mkdtemp(fake_home)) {
+        setenv("HOME", fake_home, 1);
+        char rival[512], rconf[600], rpath[800];
+        snprintf(rival, sizeof(rival), "%s/SimpleBGC_GUI_rival", fake_home);
+        snprintf(rconf, sizeof(rconf), "%s/conf", rival);
+        if (mkdir(rival, 0777) == 0 && mkdir(rconf, 0777) == 0) {
+            snprintf(rpath, sizeof(rpath), "%s/bgc.properties", rconf);
+            staged = write_file(rpath,
+                "last.used.port=/dev/ttyRIVAL\n"
+                "latest.serial.baud=4\n");
+        }
+    }
+
     sbgc_gui_config_t gc;
     sbgc_gui_config_discover(&gc, root);
+
+    check("a competing install was staged where the scan looks", staged != 0,
+          fake_home);
+    check("an explicitly named directory wins over the automatic scan",
+          strcmp(gc.port, "/dev/ttyUSB3") == 0 && gc.baud == 57600,
+          gc.summary);
 
     check("the install directory is recorded",
           strcmp(gc.install_dir, root) == 0, gc.install_dir);
@@ -604,15 +674,20 @@ static void test_gui_config(void)
           strstr(gc.summary, root) != NULL, gc.summary);
 
     /*
-     * The remaining cases assert that nothing was found, so the automatic
-     * scan of $HOME must not be able to find a real install on whatever
-     * machine this runs on. Point HOME at an empty directory for them.
+     * The remaining cases assert that nothing was found. HOME already points
+     * at the staging directory above, so remove the rival install from it
+     * first — otherwise the scan would legitimately find that one.
      */
-    char fake_home[] = "/tmp/sbgc_home_XXXXXX";
-    const char *real_home = getenv("HOME");
-    char saved_home[512] = "";
-    if (real_home) snprintf(saved_home, sizeof(saved_home), "%s", real_home);
-    if (mkdtemp(fake_home)) setenv("HOME", fake_home, 1);
+    {
+        char rpath[800];
+        snprintf(rpath, sizeof(rpath),
+                 "%s/SimpleBGC_GUI_rival/conf/bgc.properties", fake_home);
+        unlink(rpath);
+        snprintf(rpath, sizeof(rpath), "%s/SimpleBGC_GUI_rival/conf", fake_home);
+        rmdir(rpath);
+        snprintf(rpath, sizeof(rpath), "%s/SimpleBGC_GUI_rival", fake_home);
+        rmdir(rpath);
+    }
 
     /* A directory with nothing in it is a normal outcome, not an error. */
     char empty[] = "/tmp/sbgc_empty_XXXXXX";

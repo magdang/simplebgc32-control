@@ -44,6 +44,9 @@ const char *httpd_last_error(const httpd_t *h)
 int httpd_open(httpd_t *h, const char *bind_addr, int port)
 {
     if (!h) return -1;
+    /* Reopening a live server would otherwise strand its listener and every
+     * client it still held. */
+    if (h->fd >= 0) httpd_close(h);
     h->fd = -1;
     h->last_error[0] = '\0';
     /* Callers declare httpd_t on the stack, so the slots are indeterminate
@@ -86,9 +89,15 @@ int httpd_open(httpd_t *h, const char *bind_addr, int port)
     }
 
     /* Non-blocking accept so httpd_serve() can share a timeout with the
-     * caller's own work loop. */
+     * caller's own work loop. A blocking listener would let accept() stall the
+     * whole serve round, which is the one thing this design must not allow, so
+     * failing to set it is fatal rather than ignored. */
     int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+        set_err(h, "fcntl(O_NONBLOCK): %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
 
     h->fd = fd;
     return 0;
@@ -181,6 +190,14 @@ static int client_read(httpd_client_t *c)
         size_t want = 0;
         int bad = 0;
         if (cl) {
+            /*
+             * Two headers disagreeing about the body length is how a request
+             * gets read one way here and another way by anything downstream.
+             * There is nothing downstream of this server, but accepting the
+             * ambiguity costs nothing to refuse and is never legitimate.
+             */
+            if (strcasestr(cl + 1, "\ncontent-length:")) bad = 1;
+
             const char *v = cl + 16;
             while (*v == ' ' || *v == '\t') v++;
             if (*v < '0' || *v > '9') {
@@ -189,10 +206,16 @@ static int client_read(httpd_client_t *c)
                 char *end = NULL;
                 errno = 0;
                 unsigned long n2 = strtoul(v, &end, 10);
-                if (errno == ERANGE || n2 > (unsigned long)HTTPD_MAX_BODY - 1)
+                if (errno == ERANGE || n2 > (unsigned long)HTTPD_MAX_BODY - 1) {
                     bad = 1;
-                else
-                    want = (size_t)n2;
+                } else {
+                    /* The digits must be the whole value. "5junk" parsed as 5
+                     * and the rest was ignored. */
+                    const char *t = end;
+                    while (*t == ' ' || *t == '\t') t++;
+                    if (*t != '\r' && *t != '\n' && *t != '\0') bad = 1;
+                    else want = (size_t)n2;
+                }
             }
         }
         c->buf[c->header_end] = saved;
@@ -218,6 +241,11 @@ static int write_all(int fd, const char *p, size_t n, long deadline_ms)
 {
     size_t off = 0;
     while (off < n) {
+        /* Checked every pass, not only after EAGAIN: a peer that accepts a
+         * few bytes at a time makes steady progress and would otherwise run
+         * past the budget indefinitely. */
+        if (now_ms() >= deadline_ms) return -1;
+
         ssize_t w = write(fd, p + off, n - off);
         if (w > 0) { off += (size_t)w; continue; }
         if (w < 0 && errno == EINTR) continue;
@@ -225,7 +253,9 @@ static int write_all(int fd, const char *p, size_t n, long deadline_ms)
             long left = deadline_ms - now_ms();
             if (left <= 0) return -1;
             struct pollfd pw = { fd, POLLOUT, 0 };
-            if (poll(&pw, 1, (int)left) <= 0) return -1;
+            int pr2 = poll(&pw, 1, (int)left);
+            if (pr2 < 0 && errno == EINTR) continue;   /* not a failure */
+            if (pr2 <= 0) return -1;
             continue;
         }
         return -1;
@@ -372,11 +402,14 @@ int httpd_serve(httpd_t *h, int timeout_ms, httpd_handler cb, void *user)
     }
 
     int pr = poll(p, n, wait_ms);
-    if (pr < 0) {
-        if (errno == EINTR) return 0;
+    if (pr < 0 && errno != EINTR) {
         set_err(h, "poll: %s", strerror(errno));
         return -1;
     }
+    /* An interrupted poll reports no readiness, but time still passed, so fall
+     * through to the sweep rather than returning and leaving expired clients
+     * held until some later call happens not to be interrupted. */
+    if (pr < 0) for (nfds_t k = 0; k < n; k++) p[k].revents = 0;
 
     int handled = 0;
 
@@ -446,12 +479,29 @@ int httpd_serve(httpd_t *h, int timeout_ms, httpd_handler cb, void *user)
              * remove.
              */
             if (free_slot < 0) {
-                int oldest = 0;
-                for (int i = 1; i < HTTPD_MAX_CLIENTS; i++)
-                    if (h->client[i].deadline_ms < h->client[oldest].deadline_ms)
-                        oldest = i;
-                client_free(&h->client[oldest]);
-                free_slot = oldest;
+                /*
+                 * Prefer a slot that has received nothing at all. Everything
+                 * ready was served above, so a slot still holding bytes is a
+                 * request that arrived partly and may yet complete, while one
+                 * holding none has said nothing since it connected. Falling
+                 * back to the oldest keeps the guarantee that a newcomer is
+                 * never simply refused.
+                 */
+                int victim = -1;
+                for (int i = 0; i < HTTPD_MAX_CLIENTS; i++) {
+                    if (h->client[i].len != 0) continue;
+                    if (victim < 0 ||
+                        h->client[i].deadline_ms < h->client[victim].deadline_ms)
+                        victim = i;
+                }
+                if (victim < 0) {
+                    victim = 0;
+                    for (int i = 1; i < HTTPD_MAX_CLIENTS; i++)
+                        if (h->client[i].deadline_ms < h->client[victim].deadline_ms)
+                            victim = i;
+                }
+                client_free(&h->client[victim]);
+                free_slot = victim;
             }
 
             int one = 1;

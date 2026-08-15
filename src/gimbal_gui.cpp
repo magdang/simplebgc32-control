@@ -2561,6 +2561,18 @@ int main(int argc, char **argv)
      * something else.
      */
     if (!probe_port.empty()) {
+        /*
+         * --simulate promises that no serial device is opened. Probing opens a
+         * real one, so the two together would quietly break that promise on
+         * the very flag an operator reaches for when they want to be sure
+         * nothing is touched.
+         */
+        if (opt.simulate) {
+            std::fprintf(stderr,
+                "--probe-port opens a real device, which --simulate promises "
+                "not to do. Use one or the other.\n");
+            return 2;
+        }
         bool ok = probe_is_sbgc(probe_port.c_str(), opt.baud);
         std::printf("%s: %s\n", probe_port.c_str(),
                     ok ? "answered as a SimpleBGC"

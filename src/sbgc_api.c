@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -357,6 +358,14 @@ int sbgc_send(sbgc_t *sb, uint8_t cmd_id,
     return 0;
 }
 
+/* Milliseconds on the monotonic clock, for bounding the drain below. */
+static long sbgc_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 int sbgc_poll(sbgc_t *sb, int timeout_ms, sbgc_frame_cb cb, void *user)
 {
     if (!sb) return -1;
@@ -364,6 +373,22 @@ int sbgc_poll(sbgc_t *sb, int timeout_ms, sbgc_frame_cb cb, void *user)
 
     int frames = 0;
     struct pollfd pfd = { sb->fd, POLLIN, 0 };
+
+    /*
+     * The drain below re-polls with a zero timeout, which returns immediately
+     * while any byte is waiting. Against a device that transmits continuously
+     * — a LiDAR or GPS on the same hub as the gimbal, or a serial line picking
+     * up noise — that condition never goes false and this function never
+     * returns. It is called from the serial thread, so the loop that carries
+     * the motion watchdog would stop running entirely.
+     *
+     * The caller's timeout therefore bounds the whole call, not just the first
+     * poll, and the number of reads is capped as well so a fast producer
+     * cannot keep it here even inside that budget.
+     */
+    const long deadline = sbgc_now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+    int reads = 0;
+    const int MAX_READS = 64;          /* 16 KiB at 256 bytes a read */
 
     for (;;) {
         int pr = poll(&pfd, 1, timeout_ms);
@@ -392,7 +417,10 @@ int sbgc_poll(sbgc_t *sb, int timeout_ms, sbgc_frame_cb cb, void *user)
                 if (cb) cb(cmd, pl, pl_len, user);
             }
         }
-        timeout_ms = 0;   /* drain whatever else is already buffered */
+        /* Drain whatever else is already buffered, within the budget. */
+        timeout_ms = 0;
+        if (++reads >= MAX_READS) break;
+        if (sbgc_now_ms() >= deadline) break;
     }
     return frames;
 }
