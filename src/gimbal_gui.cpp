@@ -1581,13 +1581,30 @@ std::vector<Warning> compute_warnings(const Status &st)
             }
         }
 
+        /*
+         * The numeric code is NOT translated to a name. That table lives in
+         * the Serial API specification, which this project has not verified
+         * against a board, and this file's rule is that unverified meaning is
+         * not asserted. Naming the wrong fault is worse than naming none.
+         *
+         * What the 2.6x manual does document, under Service Settings > Misc.
+         * settings, is what raises the error and how to clear it, and the
+         * encoder manual adds two more causes. That is the actionable part,
+         * so it is what the operator is given.
+         */
         if (rt.error_code != 0) {
-            char b[192];
+            char b[512];
             std::snprintf(b, sizeof(b),
-                "Board reports error code %u. This tool does not decode the "
-                "code — open the SimpleBGC GUI to see what it means.",
+                "Board reports error code %u and has stopped stabilising. "
+                "Documented causes are a high rate of I2C errors; motor-driver "
+                "over-temperature, short-circuit, under-voltage or over-current "
+                "on boards that detect it; IMU and encoder data disagreeing; "
+                "an encoder scale factor far from the configured one; starting "
+                "up outside the configured limits; or, on 2.65+, too long at "
+                "full load. To restart after an emergency stop, press the menu "
+                "button once. The SimpleBGC GUI names the exact fault.",
                 rt.error_code);
-            w.push_back({ "warn", b });
+            w.push_back({ "danger", b });
         }
 
         if (rt.i2c_error_count > 0) {

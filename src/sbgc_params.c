@@ -234,3 +234,16 @@ const char *sbgc_serial_speed_name(uint8_t index)
 
 
 /* --------------------------------------------------------- error codes -- */
+/*
+ * Deliberately not decoded here.
+ *
+ * REALTIME_DATA_3 carries a one-byte error code, and translating it to a name
+ * needs the value table from the Serial API specification. That table has not
+ * been checked against a board by this project, and this file's standing rule
+ * is that nothing is reported that cannot be justified — a confidently wrong
+ * fault name sends an operator to inspect the wrong part of the gimbal.
+ *
+ * gimbal_gui reports the raw code together with the causes the 2.6x manual
+ * does document, and with the documented way to clear the condition. Add a
+ * decoder here once the table can be verified, not before.
+ */
