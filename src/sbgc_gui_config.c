@@ -365,7 +365,24 @@ int sbgc_gui_config_discover(sbgc_gui_config_t *out, const char *extra_dir)
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
 
-    if (extra_dir && extra_dir[0]) try_install_dir(out, extra_dir);
+    /*
+     * An explicitly named directory wins outright.
+     *
+     * It used to be read first and then quietly overwritten by whatever the
+     * automatic scan turned up, because every hit calls try_install_dir and
+     * the last one to supply a value keeps it. That made --gui-dir look like
+     * it had been ignored whenever the machine also had an install in one of
+     * the usual places — which is exactly the machine an operator would be
+     * passing --gui-dir on, to point at a different one.
+     */
+    if (extra_dir && extra_dir[0] && try_install_dir(out, extra_dir)) {
+        append_summary(out, "found %s", out->install_dir);
+        if (out->have_port)   append_summary(out, "port %s", out->port);
+        if (out->have_baud)   append_summary(out, "baud %d", out->baud);
+        if (out->have_limits) append_summary(out, "limits from profile 1");
+        else append_summary(out, "no saved profile; limits are built-in defaults");
+        return 0;
+    }
 
     const char *home = getenv("HOME");
     if (home) {

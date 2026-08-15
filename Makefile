@@ -8,9 +8,10 @@
 #   make probe      build the read-only board prober
 #   make clean
 #
-# Individual suites: test-protocol, test-ctl, test-gui, test-page.
+# Individual suites: test-protocol, test-modules, test-ctl, test-gui, test-page.
 #
-# The protocol suite is C and always runs. The other three need python3 (and
+# The protocol and module suites are C and always run. The other three need
+# python3 (and
 # node for the page); where an interpreter is missing that suite is SKIPPED
 # with a note rather than silently passing — a test that did not run is not a
 # test that passed.
@@ -31,14 +32,15 @@ BIN   := $(BUILD)/gimbal_ctl
 GUI   := $(BUILD)/gimbal_gui
 PROBE := $(BUILD)/sbgc_probe
 TEST  := $(BUILD)/test_sbgc_api
+TESTMOD := $(BUILD)/test_modules
 
 PYTHON ?= python3
 NODE   ?= node
 
-.PHONY: all test test-quick test-protocol test-ctl test-gui test-page \
+.PHONY: all test test-quick test-protocol test-modules test-ctl test-gui test-page \
         run gui probe clean
 
-all: $(BIN) $(GUI) $(TEST)
+all: $(BIN) $(GUI) $(TEST) $(TESTMOD)
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -88,6 +90,10 @@ $(PROBE): tools/sbgc_probe.c $(BUILD)/sbgc_api.o | $(BUILD)
 $(TEST): test/test_sbgc_api.c $(BUILD)/sbgc_api.o | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
+$(TESTMOD): test/test_modules.c $(BUILD)/httpd.o $(BUILD)/sbgc_params.o \
+            $(BUILD)/sbgc_gui_config.o $(BUILD)/sbgc_api.o | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
+
 # A suite that could not run leaves a marker here, so the summary below can
 # name what was missed instead of hedging unconditionally. Each suite clears
 # its own marker before deciding, and every suite target is .PHONY, so the
@@ -95,7 +101,7 @@ $(TEST): test/test_sbgc_api.c $(BUILD)/sbgc_api.o | $(BUILD)
 SKIPDIR := $(BUILD)/.skipped
 skipped_list = $$(ls $(SKIPDIR) 2>/dev/null | tr '\n' ' ')
 
-test: test-protocol test-page test-ctl test-gui
+test: test-protocol test-modules test-page test-ctl test-gui
 	@if [ -n "$(skipped_list)" ]; then \
 	    printf "\nSuites that ran passed. SKIPPED (did not run): %s\n" "$(skipped_list)"; \
 	else \
@@ -105,7 +111,7 @@ test: test-protocol test-page test-ctl test-gui
 # Same coverage minus the case that waits out a 20 s timeout, for the
 # edit-build-test loop. Everything else runs.
 test-quick: GUI_TEST_ARGS := --quick
-test-quick: test-protocol test-page test-ctl test-gui
+test-quick: test-protocol test-modules test-page test-ctl test-gui
 	@if [ -n "$(skipped_list)" ]; then \
 	    printf "\nSuites that ran passed; slow cases skipped. SKIPPED (did not run): %s\n" "$(skipped_list)"; \
 	else \
@@ -115,6 +121,10 @@ test-quick: test-protocol test-page test-ctl test-gui
 test-protocol: $(TEST)
 	@echo "=== protocol (test_sbgc_api.c) ==="
 	@./$(TEST)
+
+test-modules: $(TESTMOD)
+	@printf "\n=== modules (test_modules.c) ===\n"
+	@./$(TESTMOD)
 
 test-ctl: $(BIN)
 	@printf "\n=== CLI (test_gimbal_ctl.py) ===\n"
