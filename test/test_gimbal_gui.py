@@ -15,8 +15,10 @@ about what reached the motors.
     ./test_gimbal_gui.py [--quick]     --quick skips the 20 s timeout case
 """
 
+import socket
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from sbgc_sim import (Board, Daemon, Results, GUI_BIN, CMD_CONTROL,
@@ -370,7 +372,76 @@ def test_yaw_limits_use_the_unwrapped_angle():
         board.close()
 
 
+def test_stalled_connections_do_not_starve_the_control_path():
+    """
+    The server read each connection to completion before accepting the next,
+    with a 2 s budget each, so half-open sockets were additive: four of them
+    delayed a legitimate request by nearly eight seconds. That matters because
+    the browser republishes held rates at 20 Hz and the daemon stops the
+    gimbal when they stop arriving — a handful of idle sockets was enough to
+    starve the republisher and drop the camera mid-move.
+
+    Requests are now read out of one poll set, and a newcomer evicts the
+    oldest incomplete request rather than being refused, so filling every slot
+    does not lock anyone out either.
+    """
+    r.section("stalled connections must not starve real requests")
+    board = Board(motors_on=True)
+    d = Daemon(board, ["--allow-control", "--no-calib-gyro"])
+    stalled = []
+    try:
+        def latency():
+            t0 = time.monotonic()
+            try:
+                urllib.request.urlopen(d.base + "/api/live", timeout=20).read()
+            except Exception as exc:                       # noqa: BLE001
+                return -1.0, repr(exc)
+            return time.monotonic() - t0, ""
+
+        base_s, err = latency()
+        r.check("a request is fast with nothing else connected",
+                0 <= base_s < 1.0, f"{base_s:.3f}s {err}")
+
+        # Well past the slot count, so the eviction path is exercised too.
+        for _ in range(40):
+            try:
+                s = socket.create_connection(("127.0.0.1", d.port), timeout=2)
+                s.sendall(b"GET /api/live HTTP/1.1\r\n")   # never completed
+                stalled.append(s)
+            except OSError:
+                break
+        r.check("the stalled connections were established", len(stalled) >= 20,
+                f"{len(stalled)} opened")
+        time.sleep(0.3)
+
+        worst, err = 0.0, ""
+        for _ in range(4):
+            got, e = latency()
+            if got < 0:
+                worst, err = -1.0, e
+                break
+            worst = max(worst, got)
+        r.check("requests stay fast while they are held open",
+                0 <= worst < 1.0, f"worst {worst:.3f}s {err}")
+
+        # The compiled-in page is the one body large enough to need several
+        # writes; a partial send would show up as a short read here.
+        with urllib.request.urlopen(d.base + "/", timeout=10) as f:
+            page = f.read()
+        r.check("the full page is still delivered intact", len(page) > 10000,
+                f"{len(page)} bytes")
+    finally:
+        for s in stalled:
+            try:
+                s.close()
+            except OSError:
+                pass
+        d.close()
+        board.close()
+
+
 TESTS = [
+    (test_stalled_connections_do_not_starve_the_control_path, False),
     (test_yaw_limits_use_the_unwrapped_angle, False),
     (test_cross_origin_requests_are_refused, False),
     (test_limits_round_trip_without_changing, False),

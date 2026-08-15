@@ -26,6 +26,20 @@ extern "C" {
 #define HTTPD_MAX_PATH     256
 #define HTTPD_MAX_BODY     4096
 
+/*
+ * How many part-read requests can be in flight at once, and how long any one
+ * of them may take to arrive.
+ *
+ * Requests are read non-blockingly out of a single poll set rather than one
+ * connection at a time. That distinction matters more than it looks: when each
+ * connection was read to completion in turn, every half-open socket cost the
+ * next client the full timeout below, and the browser's rate republisher —
+ * which is what feeds the motion watchdog — was starved for seconds by a
+ * handful of idle sockets.
+ */
+#define HTTPD_MAX_CLIENTS      16
+#define HTTPD_CLIENT_TIMEOUT_MS 2000
+
 typedef struct {
     char method[8];
     char path[HTTPD_MAX_PATH];
@@ -60,8 +74,19 @@ typedef struct {
 typedef void (*httpd_handler)(const httpd_request_t *req,
                               httpd_response_t *resp, void *user);
 
+/* One partly-received request. Internal; callers never touch these. */
+typedef struct {
+    int    fd;              /* -1 when the slot is free                     */
+    size_t len;             /* bytes received so far                        */
+    size_t header_end;      /* offset just past "\r\n\r\n", 0 until seen    */
+    long   deadline_ms;     /* monotonic ms after which the slot is dropped */
+    char   peer[64];        /* dotted-quad, captured at accept time         */
+    char   buf[HTTPD_MAX_REQUEST];
+} httpd_client_t;
+
 typedef struct {
     int fd;                 /* listening socket, -1 when closed */
+    httpd_client_t client[HTTPD_MAX_CLIENTS];
     char last_error[192];
 } httpd_t;
 
