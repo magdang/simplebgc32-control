@@ -61,6 +61,27 @@ void on_interrupt(int) { g_interrupted = 1; }
  */
 const double MAX_RATE_DEG_S = 500.0;
 
+/* The largest single keypress swing. One press should not throw the camera
+ * across its whole travel. */
+const double MAX_STEP_DEG = 90.0;
+
+/* Soft limits are dead-reckoned bounds, not board-enforced ones, so they are
+ * allowed a full turn either way — but not an arbitrary number that would make
+ * the clamp meaningless. */
+const double MAX_LIMIT_DEG = 360.0;
+
+/*
+ * The bounds the runtime 'speed' and 'step' commands enforce.
+ *
+ * The setup wizard writes the very same fields, so it validates through these
+ * and nothing else. When it did not, the wizard was a way to store a value the
+ * commands would have refused, and a direction command issued with no argument
+ * then inherited it — reporting a rate nobody typed, with no token to point at.
+ */
+bool speed_ok(double v) { return v > 0.0 && v <= MAX_RATE_DEG_S; }
+bool step_ok(double v)  { return v > 0.0 && v <= MAX_STEP_DEG; }
+bool limit_ok(double v) { return v >= -MAX_LIMIT_DEG && v <= MAX_LIMIT_DEG; }
+
 // ------------------------------------------------------------------ config --
 
 // Which logical control maps onto which SBGC axis, and which way is positive.
@@ -200,6 +221,29 @@ double prompt_double(const std::string &question, double def)
     }
 }
 
+/*
+ * As prompt_double, but re-asks until the answer satisfies `ok`. `rule` states
+ * the requirement in the operator's terms, because "invalid" on its own leaves
+ * them guessing at which end they went past.
+ */
+double prompt_double_checked(const std::string &question, double def,
+                             bool (*ok)(double), const char *rule)
+{
+    for (;;) {
+        double v = prompt_double(question, def);
+        if (ok(v)) return v;
+        std::cout << "  " << rule << "\n";
+    }
+}
+
+/* Compact text for a number that has to appear in a message. */
+std::string num_text(double v)
+{
+    char b[32];
+    std::snprintf(b, sizeof(b), "%g", v);
+    return b;
+}
+
 int prompt_axis(const std::string &what, int def)
 {
     std::cout << "  " << what << " is driven by which gimbal axis?\n"
@@ -225,8 +269,10 @@ void configure_axis(const char *label, const char *positive_dir, AxisMap &m,
     m.invert = prompt_yes_no(
         std::string("  Is ") + positive_dir + " the NEGATIVE direction on this mount?",
         m.invert);
-    m.min_deg = prompt_double("  soft limit min (deg)", m.min_deg);
-    m.max_deg = prompt_double("  soft limit max (deg)", m.max_deg);
+    m.min_deg = prompt_double_checked("  soft limit min (deg)", m.min_deg,
+                                      limit_ok, "Must be between -360 and 360.");
+    m.max_deg = prompt_double_checked("  soft limit max (deg)", m.max_deg,
+                                      limit_ok, "Must be between -360 and 360.");
     if (m.min_deg > m.max_deg) {
         std::cout << "  min > max, swapping.\n";
         std::swap(m.min_deg, m.max_deg);
@@ -267,8 +313,12 @@ void run_setup(Config &cfg)
     }
 
     std::cout << "\n-- motion defaults --\n";
-    cfg.speed_deg_s = prompt_double("  default speed (deg/s)", cfg.speed_deg_s);
-    cfg.step_deg    = prompt_double("  arrow-key step (deg)",  cfg.step_deg);
+    cfg.speed_deg_s = prompt_double_checked(
+        "  default speed (deg/s)", cfg.speed_deg_s, speed_ok,
+        "Must be greater than 0 and at most 500 deg/s.");
+    cfg.step_deg = prompt_double_checked(
+        "  arrow-key step (deg)", cfg.step_deg, step_ok,
+        "Must be greater than 0 and at most 90 deg.");
     cfg.rel_frame   = prompt_yes_no(
         "  Measure angles relative to the ROBOT FRAME?\n"
         "  (n = relative to the horizon, i.e. gravity-stabilised)",
@@ -1389,13 +1439,29 @@ bool handle(const std::vector<std::string> &tok, sbgc_t &sb,
         c == "cw"   || c == "ccw") {
         double r;
         if (!opt_num(tok, 1, *cmd, cfg.speed_deg_s, r)) return true;
+
+        /*
+         * The rate is either the token the operator typed or the configured
+         * default standing in for it. Only the first of those is a token, so
+         * the value is named from `r` and tok[1] is never indexed — reporting
+         * a bad default used to read one past the end of a one-element vector.
+         */
+        const bool from_arg = (tok.size() > 1);
+        auto blame_default = [&] {
+            if (!from_arg)
+                std::cout << "  that is the configured default; set a new one "
+                             "with 'speed <deg/s>' or re-run 'setup'\n";
+        };
+
         if (r <= 0.0) {
             err_at(tok, 1, "rate must be greater than 0");
             std::cout << "  (direction comes from the command, not the sign)\n";
+            blame_default();
             return true;
         }
         if (r > MAX_RATE_DEG_S) {
-            err_at(tok, 1, "rate " + tok[1] + " deg/s is implausibly high");
+            err_at(tok, 1, "rate " + num_text(r) + " deg/s is implausibly high");
+            blame_default();
             return true;
         }
         double p = 0, t = 0, ro = 0;

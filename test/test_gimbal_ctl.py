@@ -141,10 +141,70 @@ def test_quit_stops_the_gimbal():
             f"{speeds(fs[-1][1]) if fs else 'no frames'}")
 
 
+def run_wizard(answers, commands, timeout=15):
+    """
+    Drive the setup wizard rather than skipping it with --defaults.
+
+    Answer order per axis is: axis choice, invert y/n, soft limit min, soft
+    limit max — for PAN, TILT then ROLL — followed by default speed, step and
+    the frame-reference question.
+    """
+    p = subprocess.run([CTL_BIN, "--simulate"],
+                       input="\n".join(answers + commands) + "\nquit\n",
+                       capture_output=True, text=True, timeout=timeout)
+    return p.stdout + p.stderr
+
+
+AXES_OK = ["1", "n", "-170", "170",
+           "2", "y", "-90", "40",
+           "3", "n", "-45", "45"]
+
+
+def test_wizard_validates_motion_defaults():
+    """
+    The wizard wrote speed and step through an unvalidated prompt while the
+    runtime 'speed' and 'step' commands enforced ranges, so it was a way to
+    store a value those commands would have refused.
+
+    A default above the rate ceiling then reached a direction command issued
+    with no argument, and the error path that reported it formatted tok[1] —
+    one past the end of a one-element vector. Under -D_GLIBCXX_ASSERTIONS that
+    aborts; without it, it reads whatever follows.
+    """
+    r.section("the setup wizard validates its motion defaults")
+
+    out = run_wizard(AXES_OK + ["99999", "30", "5", "y"], ["left"])
+    r.check("a speed above the ceiling is refused",
+            "at most 500 deg/s" in out, out[-400:])
+    r.check("the wizard re-asks rather than storing it",
+            out.count("default speed") >= 2)
+
+    # It survived the bad answer and the no-argument command that used to crash.
+    fs = frames(out, CMD_CONTROL)
+    r.check("'left' with no argument still sends a rate",
+            any(speeds(f[1])[2] != 0 for f in fs),
+            f"{[speeds(f[1]) for f in fs]}")
+    r.check("that rate is the accepted default, not the refused one",
+            any(speeds(f[1])[2] == -246 for f in fs),
+            f"{[speeds(f[1]) for f in fs]}")
+    r.check("no crash or assertion escaped to the output",
+            "Assertion" not in out and "Segmentation" not in out, out[-400:])
+
+    out = run_wizard(AXES_OK + ["30", "9999", "5", "y"], [])
+    r.check("a step above the ceiling is refused",
+            "at most 90 deg" in out, out[-400:])
+
+    out = run_wizard(["1", "n", "-9999", "170",
+                      "-170", "170"] + AXES_OK[4:] + ["30", "5", "y"], [])
+    r.check("a soft limit beyond a full turn is refused",
+            "between -360 and 360" in out, out[-400:])
+
+
 TESTS = [
     test_tilt_direction,
     test_non_finite_input_is_refused,
     test_rate_ceiling,
+    test_wizard_validates_motion_defaults,
     test_quit_stops_the_gimbal,
     test_sigint_stops_the_gimbal,
 ]
