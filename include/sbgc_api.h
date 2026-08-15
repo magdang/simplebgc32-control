@@ -50,6 +50,13 @@ enum {
 /*
  * CMD_CONTROL carries one mode byte per axis, in ROLL, PITCH, YAW order.
  * The low bits select the mode; the high bits are flags OR'd on top.
+ *
+ * This enumerates the protocol's value space, not this library's feature list.
+ * The modes it actually sends are NO_CONTROL, SPEED, ANGLE and
+ * ANGLE_REL_FRAME; the rest are here so a decoded mode byte can be named
+ * rather than printed as a number. Naming a value is not a promise to drive
+ * it — see the high-level ops at the bottom of this header for what is
+ * genuinely implemented.
  */
 enum {
     SBGC_MODE_NO_CONTROL      = 0,  /* leave this axis alone               */
@@ -60,16 +67,25 @@ enum {
     SBGC_MODE_ANGLE_REL_FRAME = 5   /* ANGLE_x relative to the frame       */
 };
 
+/* Likewise the flag bits: AUTO_TASK is used by home and level, the other is
+ * named for decoding. */
 enum {
     SBGC_CTRL_FLAG_AUTO_TASK      = 0x40, /* run as a task, confirm on end */
     SBGC_CTRL_FLAG_FORCE_RC_SPEED = 0x80
 };
 
-/* Menu actions for CMD_EXECUTE_MENU. */
+/*
+ * Menu actions for CMD_EXECUTE_MENU.
+ *
+ * Only gyro calibration is issued this way, because it has no dedicated
+ * command whose bytes this file has verified. Motor power and home position
+ * both do — CMD_MOTORS_ON/OFF and the CMD_CONTROL frames behind sbgc_home()
+ * — and a dedicated command says exactly what it will do, where a menu action
+ * runs whatever the operator's profile has bound to that button. The menu
+ * equivalents are deliberately not offered here.
+ */
 enum {
-    SBGC_MENU_CALIB_GYRO    = 9,
-    SBGC_MENU_MOTOR_TOGGLE  = 10,
-    SBGC_MENU_HOME_POSITION = 18
+    SBGC_MENU_CALIB_GYRO = 9
 };
 
 

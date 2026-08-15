@@ -43,9 +43,6 @@ typedef struct {
     double pitch_min, pitch_max;
     double yaw_min, yaw_max;
 
-    int    have_motor_cfg;
-    int    poles[3];            /* ROLL, PITCH, YAW */
-    int    invert[3];
 
     /* A short note explaining what was and was not found, for the UI. */
     char   summary[512];

@@ -404,11 +404,24 @@ double gp_axis_signed(const gp_t *gp, int ax, double deadzone)
     if (v > 1.0) v = 1.0;
     if (v < -1.0) v = -1.0;
 
-    if (deadzone > 0.0 && deadzone < 1.0) {
+    /*
+     * The kernel reports each axis's own flat region — the span it considers
+     * centred — from EVIOCGABS. Honour it as a floor on the caller's figure: a
+     * pad whose sticks rest noisily says so itself, and overriding that with
+     * one hard-coded number for every device is how a resting stick creeps.
+     * The caller's value still wins when it is the stricter of the two.
+     */
+    double dz = deadzone;
+    if (a->flat > 0) {
+        double kernel_dz = (double)a->flat / half;
+        if (kernel_dz > dz && kernel_dz < 1.0) dz = kernel_dz;
+    }
+
+    if (dz > 0.0 && dz < 1.0) {
         double mag = v < 0 ? -v : v;
-        if (mag <= deadzone) return 0.0;
+        if (mag <= dz) return 0.0;
         /* Rescale so the usable range still reaches full deflection. */
-        double scaled = (mag - deadzone) / (1.0 - deadzone);
+        double scaled = (mag - dz) / (1.0 - dz);
         v = (v < 0) ? -scaled : scaled;
     }
     return v;

@@ -162,19 +162,6 @@ static int read_int_list(const char *p, const char *limit, int *out, int n)
     return got;
 }
 
-static int read_bool_list(const char *p, const char *limit, int *out, int n)
-{
-    int got = 0;
-    while (p && got < n) {
-        const char *v = strstr(p, "<boolean>");
-        if (!v || (limit && v >= limit)) break;
-        v += 9;
-        out[got++] = (strncmp(v, "true", 4) == 0) ? 1 : 0;
-        p = v;
-    }
-    return got;
-}
-
 static void read_profile(sbgc_gui_config_t *c, const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -190,13 +177,6 @@ static void read_profile(sbgc_gui_config_t *c, const char *path)
     size_t rd = fread(buf, 1, (size_t)sz, f);
     buf[rd] = '\0';
     fclose(f);
-
-    /* Board-level motor configuration lives outside <all-profiles>. */
-    const char *lim = NULL;
-    const char *poles = find_tag(buf, "poles", &lim);
-    if (poles && read_int_list(poles, lim, c->poles, 3) == 3) c->have_motor_cfg = 1;
-    const char *inv = find_tag(buf, "invert", &lim);
-    if (inv) read_bool_list(inv, lim, c->invert, 3);
 
     /* The first <profile> element is profile 1. */
     const char *prof = strstr(buf, "<all-profiles>");

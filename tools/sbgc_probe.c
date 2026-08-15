@@ -14,6 +14,7 @@
 #define _DEFAULT_SOURCE 1
 
 #include "sbgc_api.h"
+#include "sbgc_params.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -21,16 +22,21 @@
 #include <unistd.h>
 
 /* ------------------------------------------------- read-only command IDs -- */
+/*
+ * Taken from the shared headers wherever they define one, so this tool and the
+ * library cannot disagree about what a command ID means. Only the extended
+ * parameter reads, which nothing else here uses, are named locally.
+ */
+#define CMD_BOARD_INFO        SBGC_CMD_BOARD_INFO
+#define CMD_BOARD_INFO_3      SBGC_CMD_BOARD_INFO_3
+#define CMD_READ_PARAMS_3     SBGC_CMD_READ_PARAMS_3
+#define CMD_REALTIME_DATA_3   SBGC_CMD_REALTIME_DATA_3
+#define CMD_REALTIME_DATA_4   SBGC_CMD_REALTIME_DATA_4
+#define CMD_GET_ANGLES        SBGC_CMD_GET_ANGLES
 
-#define CMD_BOARD_INFO        86
-#define CMD_BOARD_INFO_3      20
-#define CMD_READ_PARAMS_3     21
 #define CMD_READ_PARAMS_EXT   82
 #define CMD_READ_PARAMS_EXT2 102
 #define CMD_READ_PARAMS_EXT3 104
-#define CMD_REALTIME_DATA_3   23
-#define CMD_REALTIME_DATA_4   25
-#define CMD_GET_ANGLES        73
 
 /* Every command this tool is permitted to transmit. Anything else aborts. */
 static const uint8_t READ_ONLY_WHITELIST[] = {

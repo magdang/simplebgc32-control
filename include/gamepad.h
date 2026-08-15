@@ -90,6 +90,10 @@ int gp_poll(gp_t *gp, int timeout_ms);
  * Stick value normalised to -1..1 with a deadzone applied and the result
  * rescaled so it still reaches 1.0 at full deflection. Returns 0.0 for axes
  * the device does not report.
+ *
+ * `deadzone` is a floor, not the final word: where the kernel reports a larger
+ * flat region for the axis, that is used instead, because the device knows its
+ * own resting noise better than a single constant can.
  */
 double gp_axis_signed(const gp_t *gp, int ax, double deadzone);
 
