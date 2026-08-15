@@ -88,14 +88,29 @@ $(PROBE): tools/sbgc_probe.c $(BUILD)/sbgc_api.o | $(BUILD)
 $(TEST): test/test_sbgc_api.c $(BUILD)/sbgc_api.o | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDLIBS)
 
+# A suite that could not run leaves a marker here, so the summary below can
+# name what was missed instead of hedging unconditionally. Each suite clears
+# its own marker before deciding, and every suite target is .PHONY, so the
+# markers always describe the run that just happened.
+SKIPDIR := $(BUILD)/.skipped
+skipped_list = $$(ls $(SKIPDIR) 2>/dev/null | tr '\n' ' ')
+
 test: test-protocol test-page test-ctl test-gui
-	@printf "\nAll suites that ran passed (a SKIPPED suite above did not run).\n"
+	@if [ -n "$(skipped_list)" ]; then \
+	    printf "\nSuites that ran passed. SKIPPED (did not run): %s\n" "$(skipped_list)"; \
+	else \
+	    printf "\nAll suites passed.\n"; \
+	fi
 
 # Same coverage minus the case that waits out a 20 s timeout, for the
 # edit-build-test loop. Everything else runs.
 test-quick: GUI_TEST_ARGS := --quick
 test-quick: test-protocol test-page test-ctl test-gui
-	@printf "\nAll suites that ran passed; slow cases skipped.\n"
+	@if [ -n "$(skipped_list)" ]; then \
+	    printf "\nSuites that ran passed; slow cases skipped. SKIPPED (did not run): %s\n" "$(skipped_list)"; \
+	else \
+	    printf "\nAll suites passed; slow cases skipped.\n"; \
+	fi
 
 test-protocol: $(TEST)
 	@echo "=== protocol (test_sbgc_api.c) ==="
@@ -103,28 +118,31 @@ test-protocol: $(TEST)
 
 test-ctl: $(BIN)
 	@printf "\n=== CLI (test_gimbal_ctl.py) ===\n"
+	@mkdir -p $(SKIPDIR) && rm -f $(SKIPDIR)/ctl
 	@if command -v $(PYTHON) >/dev/null 2>&1; then \
 	    $(PYTHON) test/test_gimbal_ctl.py; \
 	else \
-	    echo "SKIPPED: $(PYTHON) not found"; \
+	    echo "SKIPPED: $(PYTHON) not found"; touch $(SKIPDIR)/ctl; \
 	fi
 
 test-gui: $(GUI)
 	@printf "\n=== daemon (test_gimbal_gui.py) ===\n"
+	@mkdir -p $(SKIPDIR) && rm -f $(SKIPDIR)/gui
 	@if command -v $(PYTHON) >/dev/null 2>&1; then \
 	    $(PYTHON) test/test_gimbal_gui.py $(GUI_TEST_ARGS); \
 	else \
-	    echo "SKIPPED: $(PYTHON) not found"; \
+	    echo "SKIPPED: $(PYTHON) not found"; touch $(SKIPDIR)/gui; \
 	fi
 
 # Depends on the page itself, not on a binary: it evaluates web/index.html's
 # own <script> block rather than anything compiled.
 test-page: web/index.html
 	@printf "\n=== page (test_web_page.js) ===\n"
+	@mkdir -p $(SKIPDIR) && rm -f $(SKIPDIR)/page
 	@if command -v $(NODE) >/dev/null 2>&1; then \
 	    $(NODE) test/test_web_page.js; \
 	else \
-	    echo "SKIPPED: $(NODE) not found"; \
+	    echo "SKIPPED: $(NODE) not found"; touch $(SKIPDIR)/page; \
 	fi
 
 run: $(BIN)
