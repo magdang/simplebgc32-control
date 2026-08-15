@@ -79,6 +79,7 @@ typedef struct {
     int    fd;              /* -1 when the slot is free                     */
     size_t len;             /* bytes received so far                        */
     size_t header_end;      /* offset just past "\r\n\r\n", 0 until seen    */
+    size_t body_len;        /* declared Content-Length, validated           */
     long   deadline_ms;     /* monotonic ms after which the slot is dropped */
     char   peer[64];        /* dotted-quad, captured at accept time         */
     char   buf[HTTPD_MAX_REQUEST];

@@ -433,6 +433,51 @@ static void test_http_requests(void)
     }
 
     /*
+     * A declared body larger than the handler's buffer must be refused, not
+     * accepted and silently truncated — the handler would otherwise act on a
+     * different request from the one that was sent.
+     */
+    memset(&hit, 0, sizeof(hit));
+    {
+        char over[512];
+        int n = snprintf(over, sizeof(over),
+            "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n",
+            HTTPD_MAX_BODY + 16);
+        exchange(&h, port, over, (size_t)n, &hit, reply, sizeof(reply));
+        check("a body larger than the handler buffer is refused",
+              strstr(reply, "413") != NULL && hit.calls == 0, reply);
+    }
+
+    memset(&hit, 0, sizeof(hit));
+    {
+        const char *huge =
+            "POST /x HTTP/1.1\r\nHost: h\r\n"
+            "Content-Length: 99999999999999999999\r\n\r\n";
+        exchange(&h, port, huge, strlen(huge), &hit, reply, sizeof(reply));
+        check("an out-of-range Content-Length is refused",
+              strstr(reply, "413") != NULL && hit.calls == 0, reply);
+    }
+
+    memset(&hit, 0, sizeof(hit));
+    {
+        const char *nan_len =
+            "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: abc\r\n\r\n";
+        exchange(&h, port, nan_len, strlen(nan_len), &hit, reply, sizeof(reply));
+        check("a non-numeric Content-Length is refused",
+              strstr(reply, "413") != NULL && hit.calls == 0, reply);
+    }
+
+    /* Exactly the declared length reaches the handler, no more. */
+    memset(&hit, 0, sizeof(hit));
+    {
+        const char *exact =
+            "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\npan=1&extra=ignored";
+        exchange(&h, port, exact, strlen(exact), &hit, reply, sizeof(reply));
+        check("only the declared body length is handed over",
+              hit.calls == 1 && strcmp(hit.body, "pan=1") == 0, hit.body);
+    }
+
+    /*
      * Connections that never finish must not stop later ones being served.
      * This is the starvation defect: the server used to read each connection
      * to completion in turn, so half-open sockets were additive.

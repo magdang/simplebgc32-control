@@ -53,6 +53,7 @@ int httpd_open(httpd_t *h, const char *bind_addr, int port)
         h->client[i].fd = -1;
         h->client[i].len = 0;
         h->client[i].header_end = 0;
+        h->client[i].body_len = 0;
         h->client[i].deadline_ms = 0;
         h->client[i].peer[0] = '\0';
     }
@@ -130,6 +131,7 @@ static void client_free(httpd_client_t *c)
     c->fd = -1;
     c->len = 0;
     c->header_end = 0;
+    c->body_len = 0;
     c->deadline_ms = 0;
     c->peer[0] = '\0';
 }
@@ -161,32 +163,78 @@ static int client_read(httpd_client_t *c)
         if (e) c->header_end = (size_t)(e - c->buf) + 4;
     }
     if (c->header_end) {
-        /* Honour Content-Length so POST bodies arrive intact. */
+        /*
+         * Honour Content-Length so POST bodies arrive intact — but validate
+         * it. An unchecked strtoul lets a declared length overflow the
+         * header_end + want comparison, and a body between HTTPD_MAX_BODY and
+         * the request buffer used to be accepted and then silently truncated
+         * when it was copied out, so the handler saw a different request from
+         * the one that was sent. Anything unusable is refused outright.
+         *
+         * The search is confined to the header block: a body is free to
+         * contain the text "content-length:" and must not be able to restate
+         * its own length.
+         */
+        char saved = c->buf[c->header_end];
+        c->buf[c->header_end] = '\0';
+        const char *cl = strcasestr(c->buf, "\ncontent-length:");
         size_t want = 0;
-        const char *cl = strcasestr(c->buf, "content-length:");
-        if (cl) want = (size_t)strtoul(cl + 15, NULL, 10);
-        if (c->len >= c->header_end + want) return 1;
+        int bad = 0;
+        if (cl) {
+            const char *v = cl + 16;
+            while (*v == ' ' || *v == '\t') v++;
+            if (*v < '0' || *v > '9') {
+                bad = 1;                        /* present but not a number */
+            } else {
+                char *end = NULL;
+                errno = 0;
+                unsigned long n2 = strtoul(v, &end, 10);
+                if (errno == ERANGE || n2 > (unsigned long)HTTPD_MAX_BODY - 1)
+                    bad = 1;
+                else
+                    want = (size_t)n2;
+            }
+        }
+        c->buf[c->header_end] = saved;
+
+        /* Subtraction, not addition: header_end + want could wrap. */
+        if (bad || want > sizeof(c->buf) - 1 - c->header_end) return -2;
+        if (c->len - c->header_end >= want) { c->body_len = want; return 1; }
     }
     if (c->len + 1 >= sizeof(c->buf)) return -2;
     return 0;
 }
 
+/*
+ * Write everything, or give up at the deadline.
+ *
+ * The socket stays non-blocking and readiness is waited for with poll, so a
+ * peer that stops reading costs at most the remaining budget rather than
+ * wedging the thread. A single write() call is never enough: a short write is
+ * normal on a socket, and ignoring one truncates a body whose Content-Length
+ * has already promised the full length.
+ */
+static int write_all(int fd, const char *p, size_t n, long deadline_ms)
+{
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, p + off, n - off);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            long left = deadline_ms - now_ms();
+            if (left <= 0) return -1;
+            struct pollfd pw = { fd, POLLOUT, 0 };
+            if (poll(&pw, 1, (int)left) <= 0) return -1;
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static void send_response(int cfd, const httpd_response_t *r)
 {
-    /*
-     * Requests are read non-blockingly, but the reply is written blocking with
-     * a send timeout. Buffering partial writes would mean carrying response
-     * state per slot for no practical gain: API replies are a few KB and fit
-     * the socket buffer outright, and the one large body — the compiled-in
-     * page — only stalls against a peer that asked for it and then stopped
-     * reading. The timeout bounds that case instead of letting it hang.
-     */
-    int fl = fcntl(cfd, F_GETFL, 0);
-    if (fl >= 0) fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
-    struct timeval tv = { HTTPD_CLIENT_TIMEOUT_MS / 1000,
-                          (HTTPD_CLIENT_TIMEOUT_MS % 1000) * 1000 };
-    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
     char head[512];
     const char *ctype = r->content_type ? r->content_type : "text/plain";
     int n = snprintf(head, sizeof(head),
@@ -197,19 +245,14 @@ static void send_response(int cfd, const httpd_response_t *r)
         "Connection: close\r\n"
         "\r\n",
         r->status, status_text(r->status), ctype, r->body_len);
+    if (n <= 0 || (size_t)n >= sizeof(head)) return;
 
-    if (n > 0) {
-        ssize_t w = write(cfd, head, (size_t)n);
-        (void)w;
-    }
-    if (r->body && r->body_len) {
-        size_t off = 0;
-        while (off < r->body_len) {
-            ssize_t w = write(cfd, r->body + off, r->body_len - off);
-            if (w <= 0) break;
-            off += (size_t)w;
-        }
-    }
+    /* One budget for the whole reply, not one per write, so repeated partial
+     * progress cannot add up to an unbounded stall. */
+    const long deadline = now_ms() + HTTPD_CLIENT_TIMEOUT_MS;
+    if (write_all(cfd, head, (size_t)n, deadline) != 0) return;
+    if (r->body && r->body_len)
+        write_all(cfd, r->body, r->body_len, deadline);
 }
 
 /* Turn one fully-received request into a response and send it. */
@@ -267,8 +310,9 @@ static void dispatch(httpd_client_t *c, httpd_handler cb, void *user)
     }
 
     if (c->header_end) {
+        /* Exactly what was declared, not whatever else arrived behind it. */
         const char *body = buf + c->header_end;
-        size_t blen = c->len - c->header_end;
+        size_t blen = c->body_len;
         if (blen >= sizeof(req.body)) blen = sizeof(req.body) - 1;
         memcpy(req.body, body, blen);
         req.body[blen] = '\0';
@@ -287,14 +331,20 @@ static void dispatch(httpd_client_t *c, httpd_handler cb, void *user)
 }
 
 /*
- * Accept everything pending, then advance every connection that has data.
+ * Serve one round: advance the requests already in hand, then take new ones.
  *
- * The listener and all in-flight requests share one poll set, so a peer that
- * sends a partial request and stops costs nothing but a slot until its
- * deadline expires. Previously each connection was read to completion before
- * the next was accepted, which made half-open sockets additive: four of them
- * delayed a legitimate request by nearly eight seconds, long enough to starve
- * the browser's rate republisher and trip the motion watchdog.
+ * The order matters and is the fix for two separate faults. Accepting first
+ * meant a new connection could evict a slot that was already in the poll
+ * snapshot — and since close() frees the lowest descriptor, the replacement
+ * often lands on the very same fd number, so comparing descriptors cannot
+ * reliably tell the two apart. It also meant a request whose bytes had already
+ * arrived could be thrown away in favour of one that had sent nothing yet.
+ * Draining ready clients first leaves nothing in the snapshot to invalidate.
+ *
+ * The listener and all in-flight requests still share one poll set, which is
+ * what stops a peer that stops sending from delaying anyone else: previously
+ * each connection was read to completion before the next was accepted, so
+ * half-open sockets were additive.
  */
 int httpd_serve(httpd_t *h, int timeout_ms, httpd_handler cb, void *user)
 {
@@ -329,69 +379,16 @@ int httpd_serve(httpd_t *h, int timeout_ms, httpd_handler cb, void *user)
     }
 
     int handled = 0;
-    now = now_ms();
 
-    /* New connections first, so a burst is not left waiting a whole cycle. */
-    if (p[0].revents & POLLIN) {
-        for (;;) {
-            struct sockaddr_in peer;
-            socklen_t plen = sizeof(peer);
-            int cfd = accept(h->fd, (struct sockaddr *)&peer, &plen);
-            if (cfd < 0) break;
-
-            int free_slot = -1;
-            for (int i = 0; i < HTTPD_MAX_CLIENTS; i++)
-                if (h->client[i].fd < 0) { free_slot = i; break; }
-
-            /*
-             * Out of slots: evict the oldest incomplete request rather than
-             * refusing the new one.
-             *
-             * Deadlines are stamped at accept time, so the oldest slot is the
-             * one that has had the longest to finish and has not. A real
-             * request completes in milliseconds; a slot still open after that
-             * is almost certainly a peer that stopped sending. Refusing the
-             * newcomer instead would let enough half-open sockets to fill the
-             * table lock every later client out until their deadlines expired,
-             * which is the same starvation this rewrite exists to remove.
-             */
-            if (free_slot < 0) {
-                int oldest = 0;
-                for (int i = 1; i < HTTPD_MAX_CLIENTS; i++)
-                    if (h->client[i].deadline_ms < h->client[oldest].deadline_ms)
-                        oldest = i;
-                client_free(&h->client[oldest]);
-                free_slot = oldest;
-            }
-
-            int one = 1;
-            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            int fl = fcntl(cfd, F_GETFL, 0);
-            fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
-
-            httpd_client_t *c = &h->client[free_slot];
-            c->fd = cfd;
-            c->len = 0;
-            c->header_end = 0;
-            c->deadline_ms = now + HTTPD_CLIENT_TIMEOUT_MS;
-            inet_ntop(AF_INET, &peer.sin_addr, c->peer, sizeof(c->peer));
-        }
-    }
-
-    /* Then advance whatever already had bytes waiting. */
+    /* --- existing requests first --- */
     for (nfds_t k = 1; k < n; k++) {
         int i = slot[k];
         httpd_client_t *c = &h->client[i];
         if (c->fd < 0) continue;
 
-        /*
-         * The accept loop above runs after the poll snapshot was taken and may
-         * have evicted this slot and handed it to a brand-new connection. The
-         * revents in hand describe the socket that used to be here, so acting
-         * on them would read — or, on a stale POLLHUP, hang up — the wrong
-         * client. The fd is the identity; if it changed, this entry is spent.
-         */
-        if (c->fd != p[k].fd) continue;
+        /* Time is re-read per client: dispatching one, and writing its reply,
+         * can outlast another's deadline. */
+        if (now_ms() >= c->deadline_ms) { client_free(c); continue; }
 
         if (p[k].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             client_free(c);
@@ -419,7 +416,66 @@ int httpd_serve(httpd_t *h, int timeout_ms, httpd_handler cb, void *user)
         }
     }
 
-    /* Retire anything that ran out of time. */
+    /* --- then new connections --- */
+    if (p[0].revents & POLLIN) {
+        /*
+         * Bounded per round. Draining until EAGAIN lets a caller that keeps
+         * connecting hold this loop inside one call indefinitely, starving the
+         * work the rest of the program has to do between serves.
+         */
+        for (int taken = 0; taken < HTTPD_MAX_CLIENTS; taken++) {
+            struct sockaddr_in peer;
+            socklen_t plen = sizeof(peer);
+            int cfd = accept(h->fd, (struct sockaddr *)&peer, &plen);
+            if (cfd < 0) break;
+
+            now = now_ms();
+
+            int free_slot = -1;
+            for (int i = 0; i < HTTPD_MAX_CLIENTS; i++)
+                if (h->client[i].fd < 0) { free_slot = i; break; }
+
+            /*
+             * Out of slots: evict the oldest request rather than refusing the
+             * new one. Deadlines are stamped at accept time, so the oldest slot
+             * has had the longest to finish and has not; anything ready was
+             * already served above, so what remains is a peer that stopped
+             * sending. Refusing the newcomer instead would let enough half-open
+             * sockets to fill the table lock out every later client until their
+             * deadlines expired, which is the starvation this all exists to
+             * remove.
+             */
+            if (free_slot < 0) {
+                int oldest = 0;
+                for (int i = 1; i < HTTPD_MAX_CLIENTS; i++)
+                    if (h->client[i].deadline_ms < h->client[oldest].deadline_ms)
+                        oldest = i;
+                client_free(&h->client[oldest]);
+                free_slot = oldest;
+            }
+
+            int one = 1;
+            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            int fl = fcntl(cfd, F_GETFL, 0);
+            if (fl < 0 || fcntl(cfd, F_SETFL, fl | O_NONBLOCK) < 0) {
+                /* Without non-blocking reads this connection could stall the
+                 * loop, which is the one thing this design must not allow. */
+                close(cfd);
+                continue;
+            }
+
+            httpd_client_t *c = &h->client[free_slot];
+            c->fd = cfd;
+            c->len = 0;
+            c->header_end = 0;
+            c->body_len = 0;
+            c->deadline_ms = now + HTTPD_CLIENT_TIMEOUT_MS;
+            inet_ntop(AF_INET, &peer.sin_addr, c->peer, sizeof(c->peer));
+        }
+    }
+
+    /* Retire anything that ran out of time while the above was running. */
+    now = now_ms();
     for (int i = 0; i < HTTPD_MAX_CLIENTS; i++)
         if (h->client[i].fd >= 0 && now >= h->client[i].deadline_ms)
             client_free(&h->client[i]);
