@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -100,6 +101,19 @@ static void test_realtime(void)
     uint8_t b[SBGC_REALTIME_3_LEN];
     memset(b, 0, sizeof(b));
 
+    /*
+     * Raw IMU samples are interleaved per axis as (ACC, GYRO), not stored as
+     * two contiguous arrays. Distinct values per field so a swapped pair or an
+     * off-by-one stride cannot pass.
+     */
+    put16(b + 0,  100);   put16(b + 2,  -200);   /* roll  acc / gyro */
+    put16(b + 4,  300);   put16(b + 6,  -400);   /* pitch acc / gyro */
+    put16(b + 8,  512);   put16(b + 10,  819);   /* yaw   acc / gyro */
+
+    put16(b + 12, 5);                 /* serial error count            */
+    put16(b + 14, SBGC_ERR_CALIB_ACC);
+    b[16] = 3;                        /* emergency-stop reason code    */
+
     /* No RC receiver: every channel reads the documented sentinel. */
     for (int i = 0; i < 6; i++) put16(b + 20 + i * 2, -10000);
 
@@ -125,6 +139,54 @@ static void test_realtime(void)
     check("cycle time passes through", rt.cycle_time_us == 1234, NULL);
     check("i2c error count passes through", rt.i2c_error_count == 7, NULL);
     check("profile index passes through", rt.cur_profile == 2, NULL);
+
+    /*
+     * The interleave is the part that is easy to get wrong, so each of the six
+     * fields is asserted separately rather than as two arrays.
+     */
+    check("roll acc/gyro come from the first interleaved pair",
+          rt.acc_raw[SBGC_ROLL] == 100 && rt.gyro_raw[SBGC_ROLL] == -200, NULL);
+    check("pitch acc/gyro come from the second interleaved pair",
+          rt.acc_raw[SBGC_PITCH] == 300 && rt.gyro_raw[SBGC_PITCH] == -400,
+          NULL);
+    check("yaw acc/gyro come from the third interleaved pair",
+          rt.acc_raw[SBGC_YAW] == 512 && rt.gyro_raw[SBGC_YAW] == 819, NULL);
+
+    /*
+     * The samples are passed through unscaled, but the documented units have
+     * to be usable: 512 counts is exactly 1 G, and 819 counts is ~50 deg/s.
+     */
+    check("the accelerometer unit is 1/512 G",
+          fabs(rt.acc_raw[SBGC_YAW] * SBGC_ACC_UNIT_G - 1.0) < 1e-9, NULL);
+    check("the gyroscope unit is ~0.061 deg/s",
+          fabs(rt.gyro_raw[SBGC_YAW] * SBGC_GYRO_UNIT_DEGS - 50.0) < 0.05,
+          NULL);
+
+    check("the serial error count is decoded", rt.serial_err_cnt == 5, NULL);
+    check("the emergency-stop sub-error is decoded",
+          rt.system_sub_error == 3, NULL);
+
+    /*
+     * SYSTEM_ERROR is what supersedes the deprecated byte at offset 54, so a
+     * board reporting a fault there must be reportable even when that byte is
+     * clear — which it is in this payload.
+     */
+    check("SYSTEM_ERROR is decoded from offset 14",
+          rt.system_error == SBGC_ERR_CALIB_ACC, NULL);
+    check("a deprecated error_code of 0 does not mask a real SYSTEM_ERROR",
+          rt.error_code == 0 && rt.system_error != 0, NULL);
+    check("a SYSTEM_ERROR bit is named",
+          sbgc_system_error_name(rt.system_error) != NULL &&
+          strcmp(sbgc_system_error_name(rt.system_error),
+                 "accelerometer not calibrated") == 0, NULL);
+    check("no error names nothing", sbgc_system_error_name(0) == NULL, NULL);
+    check("the lowest set bit wins when faults cascade",
+          strcmp(sbgc_system_error_name(SBGC_ERR_CALIB_ACC |
+                                        SBGC_ERR_EMERGENCY_STOP),
+                 "accelerometer not calibrated") == 0, NULL);
+    check("an undocumented bit is reported rather than ignored",
+          strcmp(sbgc_system_error_name(1u << 15), "unknown error") == 0,
+          NULL);
 
     check("roll decodes to 45 deg",
           rt.imu_deg[SBGC_ROLL] > 44.9 && rt.imu_deg[SBGC_ROLL] < 45.1, NULL);

@@ -57,6 +57,48 @@ enum {
 
 #define SBGC_PARAM_AXES 3   /* ROLL, PITCH, YAW — same order as sbgc_api.h */
 
+/* ----------------------------------------------------------- system error -- */
+/*
+ * SYSTEM_ERROR bits, from CMD_REALTIME_DATA_3 offset 14.
+ *
+ * The single-byte ERROR_CODE at offset 54 that this file used to be the only
+ * consumer of is marked "deprecated, replaced by the SYSTEM_ERROR variable" in
+ * the protocol specification. It is still decoded, because an older firmware
+ * may be the only thing that fills it in, but SYSTEM_ERROR is what anything
+ * new should report against: it names which fault the board is in, where the
+ * deprecated byte only says that there is one.
+ */
+enum {
+    SBGC_ERR_NO_SENSOR      = 1u << 0,
+    SBGC_ERR_CALIB_ACC      = 1u << 1,
+    SBGC_ERR_SET_POWER      = 1u << 2,
+    SBGC_ERR_CALIB_POLES    = 1u << 3,
+    SBGC_ERR_PROTECTION     = 1u << 4,
+    SBGC_ERR_SERIAL         = 1u << 5,
+    SBGC_ERR_LOW_BAT1       = 1u << 6,
+    SBGC_ERR_LOW_BAT2       = 1u << 7,
+    SBGC_ERR_GUI_VERSION    = 1u << 8,
+    SBGC_ERR_MISS_STEPS     = 1u << 9,
+    SBGC_ERR_SYSTEM         = 1u << 10,
+    SBGC_ERR_EMERGENCY_STOP = 1u << 11
+};
+
+/*
+ * Name the lowest set bit of a SYSTEM_ERROR word, or NULL when it is zero.
+ * Returns a static string; never allocates. Reporting one cause rather than a
+ * list is deliberate — these faults cascade, and the first one is the one
+ * worth acting on.
+ */
+const char *sbgc_system_error_name(uint16_t system_error);
+
+/* ------------------------------------------------------------- raw sensor -- */
+/*
+ * Wire units for the raw IMU samples at the head of CMD_REALTIME_DATA_3.
+ * Both are quoted directly from the protocol specification.
+ */
+#define SBGC_ACC_UNIT_G       (1.0 / 512.0)    /* G per LSB       */
+#define SBGC_GYRO_UNIT_DEGS   0.06103701895    /* deg/s per LSB   */
+
 /* --------------------------------------------------------- profile params -- */
 
 typedef struct {
@@ -174,13 +216,30 @@ typedef struct {
     double   frame_imu_deg[SBGC_PARAM_AXES];
     double   target_deg[SBGC_PARAM_AXES];
 
+    /*
+     * Raw sensor samples, in the board's own units — deliberately NOT scaled
+     * here. Scaling them means choosing a coordinate convention, and the
+     * specification says the accelerometer is "expressed in END coordinate
+     * system, sign is inverted", which is not this file's business to reconcile
+     * with whatever frame a caller works in. Convert with SBGC_ACC_UNIT_G and
+     * SBGC_GYRO_UNIT_DEGS at the point where the frame is known.
+     *
+     * Indexed by SBGC_ROLL / SBGC_PITCH / SBGC_YAW like everything else here.
+     */
+    int16_t  acc_raw[SBGC_PARAM_AXES];
+    int16_t  gyro_raw[SBGC_PARAM_AXES];
+
     int16_t  rc_data[6];        /* ROLL,PITCH,YAW,CMD,FC_ROLL,FC_PITCH      */
     int      rc_signal_present; /* 0 when every channel reads the -10000    */
                                 /* "no signal" sentinel                     */
 
+    uint16_t serial_err_cnt;
+    uint16_t system_error;      /* SBGC_ERR_* bits; 0 = no error            */
+    uint8_t  system_sub_error;  /* emergency-stop reason, Appendix E        */
+
     uint16_t cycle_time_us;
     uint16_t i2c_error_count;
-    uint8_t  error_code;
+    uint8_t  error_code;        /* deprecated by the board; see system_error */
     double   battery_volts;     /* BAT_LEVEL is 0.01 V per LSB              */
     uint8_t  rt_data_flags;
     uint8_t  cur_imu;

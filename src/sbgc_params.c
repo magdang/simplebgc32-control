@@ -154,8 +154,20 @@ int sbgc_parse_realtime_3(const uint8_t *b, size_t len, sbgc_realtime_t *out)
 
     memset(out, 0, sizeof(*out));
 
-    /* 0..19 are accelerometer/gyro samples and error counters; the UI has no
-     * use for raw IMU counts, so they are skipped rather than half-decoded. */
+    /*
+     * 0..11 are the raw IMU samples, interleaved per axis as
+     * (ACC, GYRO) x (ROLL, PITCH, YAW) — not two contiguous arrays. Passed
+     * through unscaled; see the struct for why.
+     */
+    for (int a = 0; a < SBGC_PARAM_AXES; a++) {
+        out->acc_raw[a]  = rd_i16(b + a * 4);
+        out->gyro_raw[a] = rd_i16(b + a * 4 + 2);
+    }
+
+    out->serial_err_cnt   = rd_u16(b + 12);
+    out->system_error     = rd_u16(b + 14);
+    out->system_sub_error = b[16];
+    /* 17..19 are RESERVED. */
 
     int any_signal = 0;
     for (int i = 0; i < 6; i++) {
@@ -173,7 +185,7 @@ int sbgc_parse_realtime_3(const uint8_t *b, size_t len, sbgc_realtime_t *out)
 
     out->cycle_time_us   = rd_u16(b + 50);
     out->i2c_error_count = rd_u16(b + 52);
-    out->error_code      = b[54];
+    out->error_code      = b[54];   /* deprecated; system_error supersedes it */
     out->battery_volts   = (double)rd_u16(b + 55) * 0.01;
     out->rt_data_flags   = b[57];
     out->cur_imu         = b[58];
@@ -235,15 +247,48 @@ const char *sbgc_serial_speed_name(uint8_t index)
 
 /* --------------------------------------------------------- error codes -- */
 /*
- * Deliberately not decoded here.
+ * Two different error fields arrive in REALTIME_DATA_3, and only one of them
+ * can honestly be named.
  *
- * REALTIME_DATA_3 carries a one-byte error code, and translating it to a name
- * needs the value table from the Serial API specification. That table has not
- * been checked against a board by this project, and this file's standing rule
- * is that nothing is reported that cannot be justified — a confidently wrong
- * fault name sends an operator to inspect the wrong part of the gimbal.
+ * SYSTEM_ERROR (offset 14) is a bitmask whose bits the Serial API
+ * specification names individually, so naming them here is transcription, not
+ * inference. That satisfies this file's standing rule that nothing is reported
+ * which cannot be justified.
  *
- * gimbal_gui reports the raw code together with the causes the 2.6x manual
- * does document, and with the documented way to clear the condition. Add a
- * decoder here once the table can be verified, not before.
+ * ERROR_CODE (offset 54) is the older one-byte field, and the spec marks it
+ * "deprecated, replaced by the SYSTEM_ERROR variable". Turning its value into
+ * a name would need a numeric table this project has not checked against a
+ * board, and a confidently wrong fault name sends an operator to inspect the
+ * wrong part of the gimbal. So it is still decoded, still reported raw, and
+ * still not named.
  */
+
+static const struct { uint16_t bit; const char *name; } SYSTEM_ERRORS[] = {
+    { SBGC_ERR_NO_SENSOR,      "no sensor" },
+    { SBGC_ERR_CALIB_ACC,      "accelerometer not calibrated" },
+    { SBGC_ERR_SET_POWER,      "cannot set motor power" },
+    { SBGC_ERR_CALIB_POLES,    "motor poles not calibrated" },
+    { SBGC_ERR_PROTECTION,     "protection triggered" },
+    { SBGC_ERR_SERIAL,         "serial error" },
+    { SBGC_ERR_LOW_BAT1,       "battery below first threshold" },
+    { SBGC_ERR_LOW_BAT2,       "battery below second threshold" },
+    { SBGC_ERR_GUI_VERSION,    "GUI version mismatch" },
+    { SBGC_ERR_MISS_STEPS,     "motor missed steps" },
+    { SBGC_ERR_SYSTEM,         "system error" },
+    { SBGC_ERR_EMERGENCY_STOP, "emergency stop" }
+};
+
+const char *sbgc_system_error_name(uint16_t system_error)
+{
+    if (system_error == 0) return NULL;
+
+    for (size_t i = 0; i < sizeof(SYSTEM_ERRORS) / sizeof(SYSTEM_ERRORS[0]); i++)
+        if (system_error & SYSTEM_ERRORS[i].bit)
+            return SYSTEM_ERRORS[i].name;
+
+    /*
+     * A bit outside the documented set. Saying so is more useful than saying
+     * nothing: it means the board knows about a fault this build does not.
+     */
+    return "unknown error";
+}
