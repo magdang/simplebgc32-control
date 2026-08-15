@@ -15,14 +15,19 @@ about what reached the motors.
     ./test_gimbal_gui.py [--quick]     --quick skips the 20 s timeout case
 """
 
+import os
+import pty
+import select
 import socket
+import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from sbgc_sim import (Board, Daemon, Results, GUI_BIN, CMD_CONTROL,
-                      quick_mode, require_binary)
+                      CMD_BOARD_INFO, quick_mode, require_binary)
 
 r = Results()
 
@@ -477,7 +482,118 @@ def test_stalled_connections_do_not_starve_the_control_path():
         board.close()
 
 
+class Decoy:
+    """
+    A serial device that is not a gimbal — a LiDAR, a GPS, anything else on the
+    robot's USB hub. It answers nothing and records every byte written to it.
+    """
+
+    def __init__(self):
+        self._master, self._slave = pty.openpty()
+        self.device = os.ttyname(self._slave)
+        self.data = bytearray()
+        self._run = True
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
+
+    def _read(self):
+        while self._run:
+            try:
+                rd, _, _ = select.select([self._master], [], [], 0.1)
+                if rd:
+                    self.data += os.read(self._master, 4096)
+            except OSError:
+                break
+
+    def commands(self):
+        """Command IDs of every well-formed frame it was sent."""
+        out, b, i = [], bytes(self.data), 0
+        while i + 4 <= len(b):
+            if b[i] != 0x3E:
+                i += 1
+                continue
+            cmd, ln = b[i + 1], b[i + 2]
+            if (cmd + ln) & 0xFF != b[i + 3] or i + 5 + ln > len(b):
+                i += 1
+                continue
+            out.append(cmd)
+            i += 5 + ln
+        return out
+
+    def close(self):
+        self._run = False
+        self._thread.join(timeout=1.0)
+        for fd in (self._master, self._slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_a_device_must_identify_itself_before_being_adopted():
+    """
+    When the configured port vanished, the daemon followed it to whatever
+    serial device happened to be enumerated first, with no check that the
+    device was a gimbal at all. On a robot with a LiDAR or GPS on the same hub
+    that means streaming CMD_CONTROL into the wrong device while telling the
+    operator the link recovered.
+
+    A candidate now has to answer CMD_BOARD_INFO before it is adopted.
+    """
+    r.section("a candidate port must identify itself as a SimpleBGC")
+    board = Board(motors_on=True)
+    decoy = Decoy()
+    try:
+        real = subprocess.run([GUI_BIN, "--probe-port", board.device],
+                              capture_output=True, text=True, timeout=30)
+        r.check("a real board is recognised", real.returncode == 0,
+                real.stdout.strip())
+
+        other = subprocess.run([GUI_BIN, "--probe-port", decoy.device],
+                               capture_output=True, text=True, timeout=30)
+        r.check("a device that answers nothing is rejected",
+                other.returncode == 1, other.stdout.strip())
+
+        # What it was sent matters as much as the verdict: identifying a
+        # device must never be a way to move one.
+        cmds = decoy.commands()
+        r.check("the decoy was only ever asked to identify itself",
+                cmds and all(c == CMD_BOARD_INFO for c in cmds),
+                f"commands seen: {sorted(set(cmds))}")
+        r.check("no control frame ever reached it",
+                CMD_CONTROL not in cmds, f"commands seen: {sorted(set(cmds))}")
+    finally:
+        decoy.close()
+        board.close()
+
+
+def test_a_missing_port_is_reported_not_papered_over():
+    """
+    With nothing else answering, the honest report is that the configured port
+    is gone — not a claim to have followed the device somewhere.
+    """
+    r.section("a missing port is reported rather than substituted")
+    board = Board(motors_on=True)
+    d = Daemon(board, ["--no-calib-gyro"])
+    try:
+        gone = "/dev/ttyUSB-does-not-exist"
+        code, _ = d.post("/api/port", "path=" + gone)
+        r.check("an unknown device is refused outright", code == 404, f"HTTP {code}")
+
+        s = d.status()
+        r.check("the daemon stayed on the working port",
+                s["link"]["port"] == board.device, s["link"]["port"])
+        r.check("it does not claim to have followed anything",
+                "following" not in (s["link"].get("note") or ""),
+                str(s["link"].get("note")))
+    finally:
+        d.close()
+        board.close()
+
+
 TESTS = [
+    (test_a_device_must_identify_itself_before_being_adopted, False),
+    (test_a_missing_port_is_reported_not_papered_over, False),
     (test_stalled_connections_do_not_starve_the_control_path, False),
     (test_yaw_limits_survive_the_display_fold, False),
     (test_limits_follow_the_displayed_angle_not_the_raw_count, False),

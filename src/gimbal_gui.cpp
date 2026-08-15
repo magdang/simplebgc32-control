@@ -51,6 +51,7 @@
 #include <vector>
 
 #include <csignal>
+#include <sys/stat.h>
 #include <ctime>
 #include <unistd.h>
 
@@ -596,6 +597,57 @@ bool send_motion(sbgc_t &sb, const char *what, Fn &&fn)
     return true;
 }
 
+/*
+ * How long to give one candidate device to identify itself, and how many
+ * times to ask. Opening a CH340 toggles DTR and resets the board, so the
+ * first query lands in that window and is simply lost — the read-only probe
+ * tool retries for the same reason.
+ */
+const double PROBE_REPLY_S  = 0.35;
+const int    PROBE_ATTEMPTS = 4;
+
+/*
+ * Does this device actually answer as a SimpleBGC?
+ *
+ * Opens it, asks for CMD_BOARD_INFO — a pure query, already on the whitelist
+ * send_query enforces — and waits briefly for a reply that parses. Nothing
+ * else is ever transmitted, so a device that turns out to be something else
+ * sees a handful of bytes it will not recognise and nothing more.
+ *
+ * This exists because "the configured port vanished" and "this other device
+ * is the gimbal" are completely different claims, and the port list cannot
+ * tell them apart. Adopting on the strength of the second without checking is
+ * how a daemon ends up streaming CMD_CONTROL into a LiDAR.
+ */
+bool probe_is_sbgc(const char *dev, int baud)
+{
+    sbgc_t p;
+    std::memset(&p, 0, sizeof(p));
+    if (sbgc_open(&p, dev, baud) != 0) return false;
+    sbgc_set_quiet(&p, 1);
+
+    bool ok = false;
+    for (int attempt = 0; attempt < PROBE_ATTEMPTS && !ok; attempt++) {
+        const uint8_t zero = 0;
+        if (!send_query(p, SBGC_CMD_BOARD_INFO, &zero, 1)) break;
+
+        const double deadline = monotonic_s() + PROBE_REPLY_S;
+        while (!ok && monotonic_s() < deadline) {
+            if (sbgc_poll(&p, 50,
+                    [](uint8_t cmd, const uint8_t *pl, size_t len, void *u) {
+                        sbgc_board_info_t bi;
+                        if (cmd == SBGC_CMD_BOARD_INFO &&
+                            sbgc_parse_board_info(pl, len, &bi) == 0)
+                            *static_cast<bool *>(u) = true;
+                    }, &ok) < 0)
+                break;
+        }
+    }
+
+    sbgc_close(&p);
+    return ok;
+}
+
 void serial_thread(Options opt)
 {
     sbgc_t sb;
@@ -688,17 +740,51 @@ void serial_thread(Options opt)
             /*
              * If the configured device has vanished — the usual cause is the
              * adapter being unplugged and re-enumerated under a new number —
-             * follow it rather than sitting on a dead path.
+             * look for where it went. Every candidate has to identify itself
+             * as a SimpleBGC before it is adopted: a robot carries more than
+             * one USB serial device, and picking whichever one happens to be
+             * enumerated first means writing gimbal frames into a LiDAR while
+             * telling the operator the link recovered.
              */
-            char resolved[512];
-            int r = sbgc_gui_config_resolve_port(opt.port.c_str(), resolved,
-                                                 sizeof(resolved));
-            if (r == 2) {
+            struct stat pst;
+            if (::stat(opt.port.c_str(), &pst) != 0) {
+                sbgc_port_t ports[SBGC_PORT_LIST_MAX];
+                int np = sbgc_gui_config_list_ports(ports, SBGC_PORT_LIST_MAX);
+
+                std::string found;
+                for (int pass = 1; pass >= 0 && found.empty(); pass--) {
+                    for (int i = 0; i < np; i++) {
+                        if (ports[i].stable != pass) continue;
+                        if (opt.port == ports[i].path) continue;
+                        if (probe_is_sbgc(ports[i].path, opt.baud)) {
+                            found = ports[i].path;
+                            break;
+                        }
+                    }
+                }
+
                 std::lock_guard<std::mutex> lk(g_status.mu);
-                g_status.port_note = "device moved; following " +
-                                     std::string(resolved);
-                g_status.port = resolved;
-                opt.port = resolved;
+                if (!found.empty()) {
+                    g_status.port_note = "device moved; following " + found +
+                                         " (it answered as a SimpleBGC)";
+                    g_status.port = found;
+                    opt.port = found;
+                } else {
+                    /*
+                     * Say what is actually true. Claiming to have followed the
+                     * device to something that never identified itself is the
+                     * failure this check exists to prevent.
+                     */
+                    g_status.port_note =
+                        "configured port is missing and no other serial device "
+                        "answered as a SimpleBGC; not adopting one blindly";
+                    g_status.link_open = false;
+                    g_status.board_responding = false;
+                    g_status.link_error = opt.port + " is not present";
+                    /* Searching probes real devices, so do it sparingly. */
+                    last_reopen = now + 3.5;
+                    continue;
+                }
             }
 
             std::memset(&sb, 0, sizeof(sb));
@@ -2344,6 +2430,8 @@ void usage()
 "  --gui-dir DIR     SimpleBGC GUI install to read defaults from\n"
 "  --pad DEV         gamepad event device; omit to auto-detect\n"
 "  --no-pad          do not look for a gamepad\n"
+"  --probe-port DEV  ask one device whether it is a SimpleBGC, then exit\n"
+"                    (sends only CMD_BOARD_INFO; exit 0 if it answered)\n"
 "  --allow-control   permit the UI to arm motion commands (off by default)\n"
 "  --no-calib-gyro   never calibrate the gyro automatically (it is ON by\n"
 "                    default). The Calibrate button still works.\n"
@@ -2390,6 +2478,7 @@ int main(int argc, char **argv)
 
     Options opt;
     bool port_from_cli = false, baud_from_cli = false;
+    std::string probe_port;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -2399,6 +2488,7 @@ int main(int argc, char **argv)
         else if (a == "--bind" && i + 1 < argc) opt.bind_addr = argv[++i];
         else if (a == "--gui-dir" && i + 1 < argc) opt.gui_dir = argv[++i];
         else if (a == "--pad" && i + 1 < argc) opt.pad_path = argv[++i];
+        else if (a == "--probe-port" && i + 1 < argc) probe_port = argv[++i];
         else if (a == "--no-pad") opt.no_pad = true;
         else if (a == "--allow-control") opt.allow_control = true;
         // The old spelling stays accepted: it named the same intent, and
@@ -2408,6 +2498,21 @@ int main(int argc, char **argv)
         else if (a == "--no-calib-gyro") opt.calib_gyro_on_motors = false;
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); return 2; }
+    }
+
+    /*
+     * Identify one device and exit. Answers "is this actually the gimbal?"
+     * without starting the daemon, which is the question the operator has
+     * when a re-plug has shuffled the ttyUSB numbering. Sends nothing but
+     * CMD_BOARD_INFO, so it is safe to point at a device that turns out to be
+     * something else.
+     */
+    if (!probe_port.empty()) {
+        bool ok = probe_is_sbgc(probe_port.c_str(), opt.baud);
+        std::printf("%s: %s\n", probe_port.c_str(),
+                    ok ? "answered as a SimpleBGC"
+                       : "did NOT answer as a SimpleBGC");
+        return ok ? 0 : 1;
     }
 
     // --- recover defaults so the common case needs no arguments ---

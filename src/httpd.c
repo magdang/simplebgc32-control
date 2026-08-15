@@ -384,6 +384,15 @@ int httpd_serve(httpd_t *h, int timeout_ms, httpd_handler cb, void *user)
         httpd_client_t *c = &h->client[i];
         if (c->fd < 0) continue;
 
+        /*
+         * The accept loop above runs after the poll snapshot was taken and may
+         * have evicted this slot and handed it to a brand-new connection. The
+         * revents in hand describe the socket that used to be here, so acting
+         * on them would read — or, on a stale POLLHUP, hang up — the wrong
+         * client. The fd is the identity; if it changed, this entry is spent.
+         */
+        if (c->fd != p[k].fd) continue;
+
         if (p[k].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             client_free(c);
             continue;
