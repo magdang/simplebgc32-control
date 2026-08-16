@@ -200,6 +200,13 @@ int sbgc_parse_params_3(const uint8_t *payload, size_t len, sbgc_params_t *out);
  * imu_deg and target_deg were validated by comparing them with the
  * independently-parsed CMD_GET_ANGLES response taken moments apart; both
  * agreed to within a sample.
+ *
+ * This struct is a source-level interface, not a stable ABI. It grows as more
+ * of the payload is decoded, and sbgc_parse_realtime_3 memsets sizeof(*out),
+ * so anything that allocates one must be compiled against this header rather
+ * than linked against a differently-sized build of it. That is not a
+ * restriction in practice — the project ships no shared library — but it is
+ * worth knowing before pinning a copy of this header somewhere else.
  */
 typedef struct {
     /*

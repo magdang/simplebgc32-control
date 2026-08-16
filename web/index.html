@@ -1283,10 +1283,15 @@ function render(s) {
          t.battery_volts.toFixed(2) + " V");
   }
 
-  if (!t.valid)          lamp("lampFault", "off", "unknown");
-  else if (t.error_code) lamp("lampFault", "caution", "error " + t.error_code);
-  else if (t.i2c_errors) lamp("lampFault", "caution", t.i2c_errors + " I²C errors");
-  else                   lamp("lampFault", "live", "no faults");
+  // system_error is checked before error_code: the board deprecated the latter,
+  // so a current firmware can report a fault in system_error while error_code
+  // stays zero. Checking only error_code showed "no faults" during a real one.
+  if (!t.valid)             lamp("lampFault", "off", "unknown");
+  else if (t.system_error)  lamp("lampFault", "caution",
+                                 t.system_error_name || "error");
+  else if (t.error_code)    lamp("lampFault", "caution", "error " + t.error_code);
+  else if (t.i2c_errors)    lamp("lampFault", "caution", t.i2c_errors + " I²C errors");
+  else                      lamp("lampFault", "live", "no faults");
 
   // The daemon reports a pad wired to the robot; the browser reports one
   // wired to whatever is viewing the page. Either can fly the camera.

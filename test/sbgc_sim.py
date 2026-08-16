@@ -79,7 +79,7 @@ class Board:
 
     def __init__(self, motors_on=False, angles=(0.0, 0.0, 0.0),
                  rc_limits=None, follow_mode=1, skip_gyro_calib=1,
-                 answer_realtime=True):
+                 answer_realtime=True, system_error=0):
         self.lock = threading.Lock()
         self.motors_on = motors_on
         self.angles = list(angles)          # ROLL, PITCH, YAW, board convention
@@ -90,6 +90,11 @@ class Board:
         self.follow_mode = follow_mode
         self.skip_gyro_calib = skip_gyro_calib
         self.answer_realtime = answer_realtime
+        # SYSTEM_ERROR bitmask. The deprecated one-byte ERROR_CODE at offset 54
+        # is deliberately left at zero whatever this is set to, so a test can
+        # reproduce the case a current board actually presents: a real fault
+        # that the deprecated field does not mention.
+        self.system_error = system_error
 
         self.received = []                  # (cmd, payload) in arrival order
         self.calibs = []                    # monotonic time of each calib
@@ -105,6 +110,7 @@ class Board:
 
     def _realtime_payload(self):
         b = bytearray(REALTIME_3_LEN)
+        b[14:16] = (self.system_error & 0xFFFF).to_bytes(2, "little")
         # rc_data: the -10000 sentinel on every channel means "no RC signal",
         # which is the honest state for a board with nothing plugged into it.
         for i in range(6):

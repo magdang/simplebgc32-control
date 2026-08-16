@@ -32,6 +32,37 @@ from sbgc_sim import (Board, Daemon, Results, GUI_BIN, CMD_CONTROL,
 
 r = Results()
 
+# SYSTEM_ERROR bit 11, the one the board sets for an emergency stop. Chosen
+# because its high byte is non-zero, so a one-byte read of the field would not
+# see it.
+SBGC_ERR_EMERGENCY_STOP = 1 << 11
+
+
+def test_system_error_is_reported_when_the_deprecated_code_is_clear():
+    """
+    The board deprecated its one-byte ERROR_CODE in favour of SYSTEM_ERROR, so
+    a current firmware can sit in emergency stop with the old field reading
+    zero. Reporting only the old field showed a console with no faults at all
+    during a real one — which is the exact failure this project's rules exist
+    to prevent.
+    """
+    board = Board(system_error=SBGC_ERR_EMERGENCY_STOP)
+    d = Daemon(board, ["--no-calib-gyro"])
+    try:
+        t = d.status()["telemetry"]
+        r.check("the deprecated byte really is clear",
+                t.get("error_code") == 0, str(t)[:200])
+        r.check("SYSTEM_ERROR reaches the status document",
+                t.get("system_error") == SBGC_ERR_EMERGENCY_STOP, str(t)[:200])
+        r.check("and is named rather than left as a number",
+                t.get("system_error_name") == "emergency stop",
+                repr(t.get("system_error_name")))
+        r.check("the operator is warned", "emergency stop" in d.warnings(),
+                d.warnings()[:200])
+    finally:
+        d.close()
+        board.close()
+
 
 def test_stale_angle_blocks_limited_motion():
     """
@@ -667,6 +698,7 @@ def test_simulate_needs_no_hardware_and_says_so():
 TESTS = [
     (test_simulate_needs_no_hardware_and_says_so, False),
     (test_a_device_must_identify_itself_before_being_adopted, False),
+    (test_system_error_is_reported_when_the_deprecated_code_is_clear, False),
     (test_a_missing_port_is_reported_not_papered_over, False),
     (test_stalled_connections_do_not_starve_the_control_path, False),
     (test_yaw_limits_survive_the_display_fold, False),

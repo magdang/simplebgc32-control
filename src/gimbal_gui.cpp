@@ -1615,10 +1615,32 @@ std::vector<Warning> compute_warnings(const Status &st)
         }
 
         /*
-         * The numeric code is NOT translated to a name. That table lives in
-         * the Serial API specification, which this project has not verified
-         * against a board, and this file's rule is that unverified meaning is
-         * not asserted. Naming the wrong fault is worse than naming none.
+         * SYSTEM_ERROR is checked first and reported by name, because the
+         * specification names its bits individually. It is also the field a
+         * current board actually fills in: the numeric code below is marked
+         * deprecated, so a board can be in emergency stop with SYSTEM_ERROR
+         * set and that code still reading zero. Reporting only the deprecated
+         * byte meant this console showed "no faults" in exactly that case.
+         */
+        if (rt.system_error != 0) {
+            const char *name = sbgc_system_error_name(rt.system_error);
+            char b[320];
+            std::snprintf(b, sizeof(b),
+                "Board reports %s (SYSTEM_ERROR 0x%04X, sub-error %u). "
+                "To restart after an emergency stop, press the menu button "
+                "once. The SimpleBGC GUI shows the full fault list.",
+                name ? name : "an error", rt.system_error,
+                rt.system_sub_error);
+            w.push_back({ "danger", b });
+        }
+
+        /*
+         * The deprecated numeric code is NOT translated to a name. That table
+         * lives in the Serial API specification, which this project has not
+         * verified against a board, and this file's rule is that unverified
+         * meaning is not asserted. Naming the wrong fault is worse than naming
+         * none — which is precisely why SYSTEM_ERROR above may be named and
+         * this may not.
          *
          * What the 2.6x manual does document, under Service Settings > Misc.
          * settings, is what raises the error and how to clear it, and the
@@ -1896,7 +1918,13 @@ std::string build_status_json()
         kv_num(o, "battery_volts", rt.battery_volts, 2);
         kv_int(o, "cycle_time_us", rt.cycle_time_us);
         kv_int(o, "i2c_errors", rt.i2c_error_count);
-        kv_int(o, "error_code", rt.error_code);
+        kv_int(o, "error_code", rt.error_code);   // deprecated by the board
+        kv_int(o, "system_error", rt.system_error);
+        kv_int(o, "system_sub_error", rt.system_sub_error);
+        {
+            const char *name = sbgc_system_error_name(rt.system_error);
+            kv_str(o, "system_error_name", name ? name : "");
+        }
         kv_int(o, "cur_profile", rt.cur_profile + 1);   // 1-based for humans
         kv_bool(o, "rc_signal", rt.rc_signal_present);
 

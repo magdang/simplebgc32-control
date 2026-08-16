@@ -110,9 +110,15 @@ static void test_realtime(void)
     put16(b + 4,  300);   put16(b + 6,  -400);   /* pitch acc / gyro */
     put16(b + 8,  512);   put16(b + 10,  819);   /* yaw   acc / gyro */
 
-    put16(b + 12, 5);                 /* serial error count            */
-    put16(b + 14, SBGC_ERR_CALIB_ACC);
-    b[16] = 3;                        /* emergency-stop reason code    */
+    /*
+     * Both of these are deliberately chosen so their HIGH byte is non-zero: a
+     * regression to a one-byte read would otherwise decode them correctly and
+     * the test would pass. 40000 also exceeds INT16_MAX, so a signed read of
+     * the counter shows up as a negative rather than silently agreeing.
+     */
+    put16(b + 12, (int16_t)40000);         /* serial error count       */
+    put16(b + 14, SBGC_ERR_EMERGENCY_STOP);/* 1 << 11 — high byte set  */
+    b[16] = 3;                             /* emergency-stop reason    */
 
     /* No RC receiver: every channel reads the documented sentinel. */
     for (int i = 0; i < 6; i++) put16(b + 20 + i * 2, -10000);
@@ -162,7 +168,8 @@ static void test_realtime(void)
           fabs(rt.gyro_raw[SBGC_YAW] * SBGC_GYRO_UNIT_DEGS - 50.0) < 0.05,
           NULL);
 
-    check("the serial error count is decoded", rt.serial_err_cnt == 5, NULL);
+    check("the serial error count is decoded from both bytes, unsigned",
+          rt.serial_err_cnt == 40000, NULL);
     check("the emergency-stop sub-error is decoded",
           rt.system_sub_error == 3, NULL);
 
@@ -171,14 +178,14 @@ static void test_realtime(void)
      * board reporting a fault there must be reportable even when that byte is
      * clear — which it is in this payload.
      */
-    check("SYSTEM_ERROR is decoded from offset 14",
-          rt.system_error == SBGC_ERR_CALIB_ACC, NULL);
+    check("SYSTEM_ERROR is decoded from offset 14, high byte included",
+          rt.system_error == SBGC_ERR_EMERGENCY_STOP, NULL);
     check("a deprecated error_code of 0 does not mask a real SYSTEM_ERROR",
           rt.error_code == 0 && rt.system_error != 0, NULL);
     check("a SYSTEM_ERROR bit is named",
           sbgc_system_error_name(rt.system_error) != NULL &&
           strcmp(sbgc_system_error_name(rt.system_error),
-                 "accelerometer not calibrated") == 0, NULL);
+                 "emergency stop") == 0, NULL);
     check("no error names nothing", sbgc_system_error_name(0) == NULL, NULL);
     check("the lowest set bit wins when faults cascade",
           strcmp(sbgc_system_error_name(SBGC_ERR_CALIB_ACC |
